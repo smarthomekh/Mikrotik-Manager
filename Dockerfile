@@ -13,17 +13,21 @@ RUN if ! command -v node >/dev/null 2>&1; then \
 
 WORKDIR /app
 
-# Copy dependency manifests
-COPY package*.json ./
-
-# Install dependencies (ensure build tools are installed)
-RUN npm install --unsafe-perm
-
-# Copy application source code
+# Copy all repository files (including pre-built dist)
 COPY . .
 
-# Build client production bundle and bundled server.js
-RUN npm run build
+# Install dependencies:
+# If pre-built dist/ is present, only install lightweight runtime dependencies (fast & zero memory crash).
+# Otherwise compile from source.
+RUN if [ -f "dist/server.js" ] && [ -f "dist/index.html" ]; then \
+      echo "=== Pre-built dist detected. Installing lightweight runtime dependencies... ===" && \
+      npm install --omit=dev --no-audit --no-fund; \
+    else \
+      echo "=== No pre-built dist found. Compiling from source... ===" && \
+      npm install --unsafe-perm && \
+      npm run build && \
+      npm prune --production; \
+    fi
 
 # Make startup script executable
 COPY run.sh /run.sh
