@@ -1,0 +1,78 @@
+name: mikrotik-manager
+
+services:
+  mikrotik-manager:
+    image: ghcr.io/smarthomecomkh/mikrotik-manager:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mikrotik-manager
+    restart: unless-stopped
+    network_mode: bridge
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - ROUTER_HOST=192.168.99.1
+      - ROUTER_PORT=443
+      - ROUTER_USER=admin
+      - ROUTER_PASSWORD=
+      - USE_SSL=true
+      - ALLOW_INSECURE_CERT=true
+      - DEMO_MODE=true
+    volumes:
+      - /DATA/AppData/mikrotik-manager/data:/data
+    x-casaos:
+      envs:
+        - container: ROUTER_HOST
+          description:
+            en_us: "MikroTik Router IP address (e.g. 192.168.88.1 or 192.168.99.1)"
+        - container: ROUTER_PORT
+          description:
+            en_us: "RouterOS REST API port (8443 for HTTPS or 8282/80 for HTTP)"
+        - container: ROUTER_USER
+          description:
+            en_us: "RouterOS admin username"
+        - container: ROUTER_PASSWORD
+          description:
+            en_us: "RouterOS password"
+        - container: USE_SSL
+          description:
+            en_us: "Enable SSL HTTPS connection (true/false)"
+        - container: ALLOW_INSECURE_CERT
+          description:
+            en_us: "Accept self-signed router certificate (true/false)"
+        - container: DEMO_MODE
+          description:
+            en_us: "Enable demo simulation mode (false for live router)"
+      ports:
+        - container: "3000"
+          description:
+            en_us: "MikroTik Manager Web Interface Port"
+      volumes:
+        - container: /data
+          description:
+            en_us: "Persistent storage directory for router settings and client rules"
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+    - arm
+  main: mikrotik-manager
+  author: SmartHomeKH
+  category: Network
+  description:
+    en_us: "MikroTik RouterOS Gateway Manager for CasaOS: Live WAN/LAN bandwidth graphs, popular game blocking (Roblox, Minecraft, Fortnite, Free Fire, PUBG), social media & website filtering (TikTok, YouTube, Facebook), multi-time curfew locks, simple queues QoS, and firewall rule management."
+  developer: SmartHomeKH
+  icon: https://raw.githubusercontent.com/smarthomecomkh/hasaddon/main/icon.png
+  screenshot_link:
+    - https://raw.githubusercontent.com/smarthomecomkh/hasaddon/main/icon.png
+  tagline:
+    en_us: "MikroTik RouterOS Parental Control, QoS & Firewall Manager"
+  thumbnail: https://raw.githubusercontent.com/smarthomecomkh/hasaddon/main/icon.png
+  title:
+    en_us: "MikroTik Manager"
+  index: /
+  port_map: "3000"
+  scheme: http

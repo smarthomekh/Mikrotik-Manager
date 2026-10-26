@@ -1,0 +1,32 @@
+type: vertical-stack
+title: MikroTik RouterOS Gateway
+cards:
+  - type: gauge
+    name: WAN Download Throughput
+    entity: sensor.mikrotik_wan_download_rate
+    min: 0
+    max: 500
+    needle: true
+    severity:
+      green: 0
+      yellow: 350
+      red: 450
+  - type: horizontal-stack
+    cards:
+      - type: entity
+        entity: sensor.mikrotik_wan_upload_rate
+        name: WAN Upload
+      - type: entity
+        entity: sensor.mikrotik_cpu_load
+        name: CPU Load
+  - type: custom:mini-graph-card
+    entities:
+      - entity: sensor.mikrotik_wan_download_rate
+        name: Download (Mbps)
+        color: '#00d26a'
+      - entity: sensor.mikrotik_wan_upload_rate
+        name: Upload (Mbps)
+        color: '#00a3ff'
+    line_width: 2
+    hours_to_show: 1
+    points_per_hour: 60

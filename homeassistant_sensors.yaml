@@ -1,0 +1,23 @@
+# Add this to your Home Assistant configuration.yaml to extract live MikroTik metrics!
+rest:
+  - resource: http://localhost:3000/api/throughput
+    scan_interval: 2
+    sensor:
+      - name: "MikroTik WAN Download Rate"
+        value_template: "{{ (value_json.wan.rx_bps / 1000000) | round(2) }}"
+        unit_of_measurement: "Mbps"
+        icon: "mdi:download-network"
+      - name: "MikroTik WAN Upload Rate"
+        value_template: "{{ (value_json.wan.tx_bps / 1000000) | round(2) }}"
+        unit_of_measurement: "Mbps"
+        icon: "mdi:upload-network"
+  - resource: http://localhost:3000/api/status
+    scan_interval: 10
+    sensor:
+      - name: "MikroTik CPU Load"
+        value_template: "{{ value_json.info.cpu_load_percent }}"
+        unit_of_measurement: "%"
+        icon: "mdi:cpu-64-bit"
+      - name: "MikroTik Router Uptime"
+        value_template: "{{ value_json.info.uptime }}"
+        icon: "mdi:clock-outline"
