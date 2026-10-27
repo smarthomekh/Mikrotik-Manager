@@ -510,26 +510,6 @@ export default function App() {
         isRefreshing={isRefreshing}
       />
 
-      {/* Router Connection Alert if offline or unreachable */}
-      {routerConfig && !routerConfig.connected && (
-        <div className="bg-amber-950/80 border-b border-amber-500/30 px-4 sm:px-6 py-2.5 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2 min-w-0">
-            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-            <span className="font-medium">
-              Router Not Connected ({routerConfig.host}:{routerConfig.port}):
-            </span>
-            <span className="text-amber-300 truncate max-w-xl">
-              {routerConfig.last_error || 'Cannot reach MikroTik RouterOS REST API. Please check IP, port, or credentials.'}
-            </span>
-          </div>
-          <button
-            onClick={() => setIsSettingsOpen(true)}
-            className="text-xs bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold px-3 py-1 rounded transition-colors whitespace-nowrap cursor-pointer shadow-sm"
-          >
-            Configure Connection
-          </button>
-        </div>
-      )}
 
       {/* Main Viewport Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">

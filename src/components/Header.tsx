@@ -104,59 +104,13 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Zone 3: Primary Action / Controls */}
         <div className="flex items-center gap-3 shrink-0">
-          {/* Status info */}
-          <div className="hidden sm:flex items-center gap-2 text-xs font-mono">
-            <span
-              className={`w-2 h-2 rounded-full ${
-                config?.connected
-                  ? 'bg-emerald-400 shadow-sm shadow-emerald-500/50'
-                  : 'bg-rose-400 animate-pulse'
-              }`}
-            />
-            <span className="truncate max-w-[150px] text-slate-300">
-              {config?.host ? `${config.host}:${config.port}` : 'Disconnected'}
-            </span>
-            <span
-              className={`text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded ${
-                config?.connected
-                  ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
-                  : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
-              }`}
-            >
-              {config?.connected ? 'Online' : 'Offline'}
-            </span>
-          </div>
-
           <button
             onClick={onRefresh}
             title="Refresh Router Data"
             disabled={isRefreshing}
-            className="p-2 text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 rounded-lg transition-colors border border-slate-800"
+            className="p-2 text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 rounded-lg transition-colors border border-slate-800 cursor-pointer"
           >
             <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin text-sky-400' : ''}`} />
-          </button>
-
-          {/* Panic Killswitch toggle */}
-          <button
-            onClick={onTogglePanic}
-            title={panicActive ? 'Deactivate Emergency Cutoff' : 'Activate Panic Internet Cutoff'}
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-all border whitespace-nowrap ${
-              panicActive
-                ? 'bg-rose-600 text-white border-rose-500 shadow-sm shadow-rose-900/50'
-                : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-rose-500/50 hover:text-rose-300'
-            }`}
-          >
-            <AlertOctagon className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Panic Cutoff</span>
-          </button>
-
-          {/* Router Connection Settings */}
-          <button
-            onClick={onOpenSettings}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-sky-500 text-white hover:bg-sky-400 transition-colors shadow-sm shadow-sky-500/20 whitespace-nowrap"
-          >
-            <Settings className="w-3.5 h-3.5" />
-            <span>Connection</span>
           </button>
         </div>
       </div>
