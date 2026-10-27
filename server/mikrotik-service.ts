@@ -44,6 +44,29 @@ function isPrivateLanIp(host: string): boolean {
   return false;
 }
 
+function isLegacyMikrotikApiPort(port: number): boolean {
+  return port === 8728 || port === 8729;
+}
+
+function getRouterRestPortAdvice(port: number, useSsl: boolean): { message: string; recommended: number[]; serviceLabel: string } {
+  if (isLegacyMikrotikApiPort(port)) {
+    return {
+      message:
+        'Port ' +
+        port +
+        ' is the MikroTik legacy API port, not the RouterOS REST endpoint. This app requires the web service (www or www-ssl), not the legacy API service.',
+      recommended: useSsl ? [443, 8443] : [80, 8282],
+      serviceLabel: useSsl ? 'www-ssl (HTTPS web service)' : 'www (HTTP web service)',
+    };
+  }
+
+  return {
+    message: 'This app requires the RouterOS web service port, not the legacy API port.',
+    recommended: useSsl ? [443, 8443] : [80, 8282],
+    serviceLabel: useSsl ? 'www-ssl / HTTPS web service' : 'www / HTTP web service',
+  };
+}
+
 function probePort(host: string, port: number, timeoutMs = 2500): Promise<boolean> {
   return new Promise((resolve) => {
     if (!host || isNaN(port) || port <= 0) {
@@ -836,7 +859,6 @@ class MikroTikService {
 
   constructor() {
     this.seedThroughputHistory();
-    // Start continuous telemetry ticker
     setInterval(() => this.tick(), 1000);
   }
 
@@ -861,10 +883,8 @@ class MikroTikService {
 
   private isTimeInWindow(startTime: string, endTime: string, currentHourMin: string): boolean {
     if (startTime > endTime) {
-      // Overnight window (e.g. 21:00 to 06:30)
       return currentHourMin >= startTime || currentHourMin < endTime;
     }
-    // Daytime window (e.g. 15:30 to 18:00)
     return currentHourMin >= startTime && currentHourMin <= endTime;
   }
 
@@ -880,7 +900,6 @@ class MikroTikService {
     const curTimeStr = `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
     const currentDay = this.getDayOfWeek(date);
 
-    // Periodic synchronization with live MikroTik RouterOS
     if (this.config.host) {
       this.syncRealRouter().catch(() => {});
     }
@@ -923,7 +942,6 @@ class MikroTikService {
           continue;
         }
 
-        // Multi-Restriction Time Slots Evaluation
         let activeRestrictionAction: RestrictionTimeSlot['action'] | null = null;
         let activeThrottleSpeed = '1M/512k';
 
@@ -937,12 +955,11 @@ class MikroTikService {
               if (slot.throttle_speed) {
                 activeThrottleSpeed = slot.throttle_speed;
               }
-              break; // Highest matching restriction takes precedence
+              break;
             }
           }
         }
 
-        // If time restriction action is block_all:
         if (activeRestrictionAction === 'block_all') {
           client.rx_rate_bps = 0;
           client.tx_rate_bps = 0;
@@ -950,25 +967,20 @@ class MikroTikService {
           continue;
         }
 
-        // Base speed ceiling from Simple Queue
         let maxDownBps = 100_000_000;
         if (client.max_download_limit && client.max_download_limit.endsWith('M')) {
           maxDownBps = parseFloat(client.max_download_limit) * 1_000_000;
         }
 
-        // If time restriction action is throttle:
         if (activeRestrictionAction === 'throttle') {
-          maxDownBps = Math.min(maxDownBps, 1_000_000); // Throttle down to 1 Mbps
+          maxDownBps = Math.min(maxDownBps, 1_000_000);
         }
 
-        // Fluctuate based on device category & filters
         let rxFactor = 1.0;
         if (activeRestrictionAction === 'block_games' || (client.blocked_games && client.blocked_games.length > 0)) {
-          // Drops gaming bursts (typically 40-70% reduction in high interactive traffic)
           rxFactor *= 0.45;
         }
         if (activeRestrictionAction === 'block_websites' || (client.blocked_websites && client.blocked_websites.length > 0)) {
-          // Drops video CDN & social media feeds
           rxFactor *= 0.55;
         }
 
@@ -1053,7 +1065,6 @@ class MikroTikService {
 
     this.isSyncing = true;
     try {
-      // 1. Query system resource
       const sys = await this.makeRouterOsRequest('/system/resource', { timeoutMs: 3500 });
       if (sys) {
         this.config.connected = true;
@@ -1076,7 +1087,6 @@ class MikroTikService {
         }
       }
 
-      // 2. Query interfaces and calculate live throughput
       try {
         const ifaces = await this.makeRouterOsRequest('/interface', { timeoutMs: 3000 });
         if (Array.isArray(ifaces) && ifaces.length > 0) {
@@ -1139,11 +1149,10 @@ class MikroTikService {
             this.throughputHistory.shift();
           }
         }
-      } catch (ifErr) {
+      } catch {
         // continue
       }
 
-      // Sync other tables every 3 polls (6 seconds) to avoid stressing router CPU
       this.syncCount++;
       if (this.syncCount % 3 === 0) {
         try {
@@ -1267,7 +1276,7 @@ class MikroTikService {
               comment: s.comment || '',
             }));
           }
-        } catch (subErr) {
+        } catch {
           // continue
         }
       }
@@ -1279,7 +1288,6 @@ class MikroTikService {
     }
   }
 
-  // --- Real RouterOS REST API communication (RouterOS v7) ---
   private async makeRouterOsRequest(
     endpoint: string,
     options: { method?: string; body?: any; timeoutMs?: number } = {}
@@ -1309,8 +1317,6 @@ class MikroTikService {
     return res.data;
   }
 
-  // --- Public API Methods ---
-
   public getConfig(): RouterConnectionConfig {
     return {
       ...this.config,
@@ -1329,6 +1335,12 @@ class MikroTikService {
     if (newConfig.allow_insecure_cert !== undefined) this.config.allow_insecure_cert = Boolean(newConfig.allow_insecure_cert);
     if (newConfig.poll_interval_ms !== undefined) this.config.poll_interval_ms = Number(newConfig.poll_interval_ms);
     this.config.mode = 'real';
+
+    if (isLegacyMikrotikApiPort(this.config.port)) {
+      this.config.connected = false;
+      this.config.last_error = 'Legacy MikroTik API port detected. Use the RouterOS web service port (80 / 8282 / 443 / 8443) instead of 8728 or 8729.';
+      return this.getConfig();
+    }
 
     try {
       const sysRes = await this.makeRouterOsRequest('/system/resource', { timeoutMs: 4000 });
@@ -1363,13 +1375,40 @@ class MikroTikService {
       };
     }
 
+    if (isLegacyMikrotikApiPort(port)) {
+      const restAdvice = getRouterRestPortAdvice(port, use_ssl);
+      return {
+        success: false,
+        message: `Port ${port} is the legacy MikroTik API port, not the REST API endpoint. This app requires the RouterOS web service (www / www-ssl).`,
+        diagnosis: {
+          is_private_ip: isPrivateLanIp(host),
+          tcp_open: await probePort(host, port, 2000),
+          tested_url: `${use_ssl ? 'https' : 'http'}://${host}:${port}/rest/system/resource`,
+          status_code: 0,
+          service_hints: [
+            restAdvice.message,
+            `Use ${restAdvice.serviceLabel} on one of these ports: ${restAdvice.recommended.join(', ')}`,
+          ],
+          actionable_solutions: [
+            {
+              title: 'Use the RouterOS web service, not api/api-ssl',
+              badge: 'RouterOS 7 REST API',
+              steps: [
+                'Open Winbox > IP > Services.',
+                'Check www or www-ssl (HTTP/HTTPS web service).',
+                'Use port 80/8282 for HTTP or 443/8443 for HTTPS.',
+                'Do not use 8728 or 8729 for this app.',
+              ],
+            },
+          ],
+        },
+      };
+    }
+
     const isPrivate = isPrivateLanIp(host);
     const testedUrl = `${use_ssl ? 'https' : 'http'}://${host}:${port}/rest/system/resource`;
-
-    // 1. Check TCP reachability first
     const isTcpOpen = await probePort(host, port, 3000);
 
-    // 2. Perform REST request with self-signed cert support
     try {
       const res = await doRouterRequest(
         { host, port, username, password, use_ssl, allow_insecure_cert },
@@ -1455,7 +1494,6 @@ class MikroTikService {
         },
       };
     } catch (err: any) {
-      // If primary port failed, scan other common ports to give an actionable solution
       const candidatePorts = [
         { port: 8443, ssl: true, label: '8443 (www-ssl)' },
         { port: 443, ssl: true, label: '443 (HTTPS)' },
@@ -1494,7 +1532,7 @@ class MikroTikService {
         );
         if (isPrivate) {
           serviceHints.push(
-            `'${host}' is an internal LAN address. In Home Assistant, this add-on runs directly inside your local network. Verify the router IP address matches your MikroTik gateway.`
+            `'${host}' is an internal LAN address. In Home Assistant, this add-on runs directly inside your local network. Verify the router IP address matches your MikroTik gateway.'`
           );
         }
       }
@@ -1677,7 +1715,6 @@ class MikroTikService {
     return { client, queue };
   }
 
-  // --- Multiple Restriction Time Slots ---
   public setClientSchedules(ipOrMac: string, schedules: RestrictionTimeSlot[]) {
     const client = this.clients.find(
       (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
@@ -1690,7 +1727,6 @@ class MikroTikService {
     return client;
   }
 
-  // --- Popular Games Blocking ---
   public setClientBlockedGames(ipOrMac: string, gameIds: string[]) {
     const client = this.clients.find(
       (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
@@ -1701,17 +1737,13 @@ class MikroTikService {
 
     client.blocked_games = gameIds;
 
-    // Synchronize MikroTik Firewall Filter rules for this device
-    // Remove old game rules for this device
     this.firewallRules = this.firewallRules.filter(
       (r) => !r.comment?.includes(`Game Shield [${client.ip_address}]`)
     );
 
-    // Create a drop rule for each selected game
     for (const gId of gameIds) {
       const game = POPULAR_GAMES.find((g) => g.id === gId);
       if (game) {
-        // Add drop rule for domain SNI match
         this.firewallRules.splice(5, 0, {
           id: `fw-game-${client.id}-${game.id}`,
           order: 5,
@@ -1730,7 +1762,6 @@ class MikroTikService {
     return client;
   }
 
-  // --- Popular Websites & Custom Domains Blocking ---
   public setClientBlockedWebsites(ipOrMac: string, websiteIds: string[], customDomains: string[]) {
     const client = this.clients.find(
       (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
@@ -1742,7 +1773,6 @@ class MikroTikService {
     client.blocked_websites = websiteIds;
     client.custom_blocked_domains = customDomains;
 
-    // Synchronize Firewall Filter rules for this device
     this.firewallRules = this.firewallRules.filter(
       (r) => !r.comment?.includes(`Web Shield [${client.ip_address}]`)
     );
@@ -1802,8 +1832,6 @@ class MikroTikService {
     return client;
   }
 
-  // --- Queues Management ---
-
   public getQueues(): SimpleQueue[] {
     return this.queues;
   }
@@ -1862,8 +1890,6 @@ class MikroTikService {
     return removed;
   }
 
-  // --- Schedules Management ---
-
   public getSchedules(): RouterSchedule[] {
     return this.schedules;
   }
@@ -1910,8 +1936,6 @@ class MikroTikService {
     sch.next_run = `Triggered just now`;
     return { success: true, message: `Schedule "${sch.name}" executed successfully on RouterOS.`, sch };
   }
-
-  // --- Firewall Rules Management ---
 
   public getFirewallRules() {
     return {
@@ -1998,8 +2022,6 @@ class MikroTikService {
     };
   }
 
-  // --- Home Assistant Add-on & CasaOS App Manifest & Bundle Exporter ---
-
   public getHomeAssistantPackage() {
     const configYaml = `name: "MikroTik Manager"
 description: "Manage MikroTik RouterOS queues, multi-restriction schedules, firewall, popular games & website filtering, and live throughput in Home Assistant."
@@ -2027,7 +2049,7 @@ options:
   use_ssl: ${this.config.use_ssl}
   allow_insecure_cert: ${this.config.allow_insecure_cert}
   poll_interval: 1000
-  demo_mode: false
+demo_mode: false
 schema:
   router_host: "str"
   router_port: "int"
@@ -2061,14 +2083,14 @@ schema:
     const dockerfile = `ARG BUILD_FROM=node:20-alpine
 FROM \${BUILD_FROM}
 
-ENV LANG=C.UTF-8 \\
+ENV LANG=C.UTF-8 \
     PORT=3000
 
 # Install Node.js, npm, bash, curl, and jq if not already present
-RUN if ! command -v node >/dev/null 2>&1; then \\
-      apk add --no-cache nodejs npm bash curl jq; \\
-    else \\
-      apk add --no-cache bash curl jq; \\
+RUN if ! command -v node >/dev/null 2>&1; then \
+      apk add --no-cache nodejs npm bash curl jq; \
+    else \
+      apk add --no-cache bash curl jq; \
     fi
 
 WORKDIR /app
@@ -2079,14 +2101,14 @@ COPY . .
 # Install dependencies:
 # If pre-built dist/ is present, only install lightweight runtime dependencies (fast & zero memory crash).
 # Otherwise compile from source.
-RUN if [ -f "dist/server.js" ] && [ -f "dist/index.html" ]; then \\
-      echo "=== Pre-built dist detected. Installing lightweight runtime dependencies... ===" && \\
-      npm install --omit=dev --no-audit --no-fund; \\
-    else \\
-      echo "=== No pre-built dist found. Compiling from source... ===" && \\
-      npm install --unsafe-perm && \\
-      npm run build && \\
-      npm prune --production; \\
+RUN if [ -f "dist/server.js" ] && [ -f "dist/index.html" ]; then \
+      echo "=== Pre-built dist detected. Installing lightweight runtime dependencies... ===" && \
+      npm install --omit=dev --no-audit --no-fund; \
+    else \
+      echo "=== No pre-built dist found. Compiling from source... ===" && \
+      npm install --unsafe-perm && \
+      npm run build && \
+      npm prune --production; \
     fi
 
 # Make startup script executable and fix line endings
@@ -2165,7 +2187,7 @@ x-casaos:
   author: SmartHomeKH
   category: Network
   description:
-    en_us: "MikroTik RouterOS Gateway Manager for CasaOS: Live WAN/LAN bandwidth graphs, popular game blocking (Roblox, Minecraft, Fortnite, Free Fire, PUBG), social media & website filtering (TikTok, YouTube, Facebook), multi-time curfew locks, simple queues QoS, and firewall rule management."
+    en_us: "MikroTik RouterOS Gateway Manager for CasaOS: Live WAN/LAN bandwidth graphs, popular game blocking (Roblox, Minecraft, Fortnite, Free Fire, PUBG), social media & website filtering (T[...]
   developer: SmartHomeKH
   icon: https://raw.githubusercontent.com/smarthomekh/hasaddon/main/icon.png
   screenshot_link:
