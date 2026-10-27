@@ -2,7 +2,7 @@ name: mikrotik-manager
 
 services:
   mikrotik-manager:
-    image: ghcr.io/smarthomecomkh/mikrotik-manager:latest
+    image: ghcr.io/smarthomekh/mikrotik-manager:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -65,12 +65,12 @@ x-casaos:
   description:
     en_us: "MikroTik RouterOS Gateway Manager for CasaOS: Live WAN/LAN bandwidth graphs, popular game blocking (Roblox, Minecraft, Fortnite, Free Fire, PUBG), social media & website filtering (TikTok, YouTube, Facebook), multi-time curfew locks, simple queues QoS, and firewall rule management."
   developer: SmartHomeKH
-  icon: https://raw.githubusercontent.com/smarthomecomkh/hasaddon/main/icon.png
+  icon: https://raw.githubusercontent.com/smarthomekh/hasaddon/main/icon.png
   screenshot_link:
-    - https://raw.githubusercontent.com/smarthomecomkh/hasaddon/main/icon.png
+    - https://raw.githubusercontent.com/smarthomekh/hasaddon/main/icon.png
   tagline:
     en_us: "MikroTik RouterOS Parental Control, QoS & Firewall Manager"
-  thumbnail: https://raw.githubusercontent.com/smarthomecomkh/hasaddon/main/icon.png
+  thumbnail: https://raw.githubusercontent.com/smarthomekh/hasaddon/main/icon.png
   title:
     en_us: "MikroTik Manager"
   index: /
