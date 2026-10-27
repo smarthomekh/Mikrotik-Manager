@@ -29,9 +29,9 @@ RUN if [ -f "dist/server.js" ] && [ -f "dist/index.html" ]; then \
       npm prune --production; \
     fi
 
-# Make startup script executable
+# Make startup script executable and fix line endings
 COPY run.sh /run.sh
-RUN chmod +x /run.sh
+RUN sed -i 's/$//' /run.sh && chmod +x /run.sh
 
 ENV NODE_ENV=production
 

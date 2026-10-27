@@ -20,6 +20,6 @@ Directly monitor and govern your MikroTik router inside **CasaOS** or **Home Ass
 ## 2. Installation in Home Assistant
 1. In Home Assistant, go to **Settings > Add-ons > Add-on Store**.
 2. Click three dots (top right) > **Repositories** > Add `https://github.com/smarthomecomkh/hasaddon`.
-3. Select **MikroTik Manager** (v1.3.3) and click **Install**.
+3. Select **MikroTik Manager** (v1.3.5) and click **Install**.
 4. Set your Router IP, Username, and Password in the **Configuration** tab.
 5. Click **Start** and select **Show in sidebar**!
