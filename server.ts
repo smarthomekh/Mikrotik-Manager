@@ -36,7 +36,7 @@ async function startServer() {
         password: opts.router_password || undefined,
         use_ssl: opts.use_ssl !== undefined ? Boolean(opts.use_ssl) : undefined,
         allow_insecure_cert: opts.allow_insecure_cert !== undefined ? Boolean(opts.allow_insecure_cert) : undefined,
-        mode: opts.demo_mode ? 'demo' : 'real',
+        mode: 'real',
       });
     } catch (e) {
       console.warn('[Home Assistant] Failed to read /data/options.json:', e);

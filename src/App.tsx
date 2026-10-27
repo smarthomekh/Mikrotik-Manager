@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { ClientsTab } from './components/ClientsTab.tsx';
 import { ContentFilterModal } from './components/ContentFilterModal.tsx';
 import { ContentFilterTab } from './components/ContentFilterTab.tsx';
@@ -6,7 +7,6 @@ import { DeviceSpeedModal } from './components/DeviceSpeedModal.tsx';
 import { FirewallRuleModal } from './components/FirewallRuleModal.tsx';
 import { FirewallTab } from './components/FirewallTab.tsx';
 import { Header } from './components/Header.tsx';
-import { HomeAssistantTab } from './components/HomeAssistantTab.tsx';
 import { MultiScheduleModal } from './components/MultiScheduleModal.tsx';
 import { OverviewTab } from './components/OverviewTab.tsx';
 import { QueueModal } from './components/QueueModal.tsx';
@@ -85,14 +85,13 @@ export default function App() {
   const loadAllData = async () => {
     setIsRefreshing(true);
     try {
-      const [statusRes, clientsRes, queuesRes, schedulesRes, fwRes, haRes] =
+      const [statusRes, clientsRes, queuesRes, schedulesRes, fwRes] =
         await Promise.all([
           fetch('/api/status').then((r) => r.json()),
           fetch('/api/clients').then((r) => r.json()),
           fetch('/api/queues').then((r) => r.json()),
           fetch('/api/schedules').then((r) => r.json()),
           fetch('/api/firewall').then((r) => r.json()),
-          fetch('/api/ha/package').then((r) => r.json()),
         ]);
 
       if (statusRes?.success) {
@@ -108,7 +107,6 @@ export default function App() {
         setNatRules(fwRes.nat || []);
         setPanicActive(Boolean(fwRes.killswitch_active));
       }
-      if (haRes?.success) setHaFiles(haRes.files || {});
     } catch (err) {
       console.error('Failed to load router data:', err);
     } finally {
@@ -512,6 +510,27 @@ export default function App() {
         isRefreshing={isRefreshing}
       />
 
+      {/* Router Connection Alert if offline or unreachable */}
+      {routerConfig && !routerConfig.connected && (
+        <div className="bg-amber-950/80 border-b border-amber-500/30 px-4 sm:px-6 py-2.5 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+            <span className="font-medium">
+              Router Not Connected ({routerConfig.host}:{routerConfig.port}):
+            </span>
+            <span className="text-amber-300 truncate max-w-xl">
+              {routerConfig.last_error || 'Cannot reach MikroTik RouterOS REST API. Please check IP, port, or credentials.'}
+            </span>
+          </div>
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="text-xs bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold px-3 py-1 rounded transition-colors whitespace-nowrap cursor-pointer shadow-sm"
+          >
+            Configure Connection
+          </button>
+        </div>
+      )}
+
       {/* Main Viewport Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
         {activeTab === 'overview' && (
@@ -597,10 +616,6 @@ export default function App() {
             onRunScheduleNow={handleRunScheduleNow}
           />
         )}
-
-        {activeTab === 'homeassistant' && (
-          <HomeAssistantTab files={haFiles} routerConfig={routerConfig} />
-        )}
       </main>
 
       {/* Modals */}
@@ -611,7 +626,6 @@ export default function App() {
           config={routerConfig}
           onSave={handleSaveConfig}
           onTest={handleTestConnection}
-          onSwitchToSimulator={() => loadAllData()}
         />
       )}
 

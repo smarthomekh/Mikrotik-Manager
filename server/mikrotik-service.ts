@@ -1,3 +1,4 @@
+import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import { POPULAR_GAMES, POPULAR_WEBSITES } from '../src/data/blocklist-catalog.ts';
@@ -17,9 +18,21 @@ import type {
 } from '../src/types/mikrotik.ts';
 
 // HTTPS agent allowing self-signed MikroTik certificates
-const insecureAgent = new https.Agent({
+const insecureHttpsAgent = new https.Agent({
   rejectUnauthorized: false,
+  keepAlive: true,
 });
+
+const defaultHttpAgent = new http.Agent({
+  keepAlive: true,
+});
+
+interface RouterHttpResponse {
+  status: number;
+  statusText: string;
+  data: any;
+  raw: string;
+}
 
 function isPrivateLanIp(host: string): boolean {
   if (!host) return false;
@@ -54,17 +67,87 @@ function probePort(host: string, port: number, timeoutMs = 2500): Promise<boolea
   });
 }
 
+function doRouterRequest(
+  config: { host: string; port: number; use_ssl: boolean; allow_insecure_cert: boolean; username: string; password?: string },
+  endpoint: string,
+  options: { method?: string; body?: any; timeoutMs?: number } = {}
+): Promise<RouterHttpResponse> {
+  return new Promise((resolve, reject) => {
+    const isHttps = Boolean(config.use_ssl);
+    const client = isHttps ? https : http;
+    const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+    const restPath = cleanEndpoint.startsWith('/rest') ? cleanEndpoint : `/rest${cleanEndpoint}`;
+    const auth = Buffer.from(`${config.username || 'admin'}:${config.password || ''}`).toString('base64');
+    const bodyStr = options.body ? JSON.stringify(options.body) : null;
+
+    const reqOptions: https.RequestOptions = {
+      hostname: config.host,
+      port: config.port,
+      path: restPath,
+      method: (options.method || 'GET').toUpperCase(),
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(bodyStr ? { 'Content-Length': Buffer.byteLength(bodyStr) } : {}),
+      },
+      agent: isHttps ? insecureHttpsAgent : defaultHttpAgent,
+      timeout: options.timeoutMs || 6000,
+    };
+
+    if (isHttps && config.allow_insecure_cert) {
+      reqOptions.rejectUnauthorized = false;
+    }
+
+    const req = client.request(reqOptions, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      res.on('end', () => {
+        let parsed: any = null;
+        try {
+          parsed = JSON.parse(data);
+        } catch {
+          parsed = data;
+        }
+        resolve({
+          status: res.statusCode || 200,
+          statusText: res.statusMessage || '',
+          data: parsed,
+          raw: data,
+        });
+      });
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`Connection timed out after ${options.timeoutMs || 6000}ms`));
+    });
+
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    if (bodyStr) {
+      req.write(bodyStr);
+    }
+    req.end();
+  });
+}
+
 class MikroTikService {
   private config: RouterConnectionConfig = {
-    host: '192.168.88.1',
-    port: 443,
+    host: '192.168.99.1',
+    port: 8443,
     username: 'admin',
     password: '',
     use_ssl: true,
     allow_insecure_cert: true,
     poll_interval_ms: 1000,
-    mode: 'demo', // default to demo so UI is immediately responsive; user can switch anytime
-    connected: true,
+    mode: 'real',
+    connected: false,
     last_sync: new Date().toISOString(),
   };
 
@@ -797,7 +880,12 @@ class MikroTikService {
     const curTimeStr = `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
     const currentDay = this.getDayOfWeek(date);
 
-    if (this.config.mode === 'demo') {
+    // Periodic synchronization with live MikroTik RouterOS
+    if (this.config.host) {
+      this.syncRealRouter().catch(() => {});
+    }
+
+    if (!this.config.connected || this.config.mode === 'demo') {
       // Fluctuate CPU slightly
       this.routerInfo.cpu_load_percent = Math.min(
         95,
@@ -955,51 +1043,270 @@ class MikroTikService {
     }
   }
 
-  // --- Real RouterOS REST API communication (RouterOS v7) ---
-  private async makeRouterOsRequest(endpoint: string, options: { method?: string; body?: any } = {}) {
-    if (!this.config.host) {
-      throw new Error('Router host not configured');
-    }
+  private lastPollWanBytes: { rx: number; tx: number; time: number } | null = null;
+  private isSyncing = false;
+  private syncCount = 0;
 
-    const protocol = this.config.use_ssl ? 'https' : 'http';
-    const port = this.config.port || (this.config.use_ssl ? 8443 : 8282);
-    const url = `${protocol}://${this.config.host}:${port}/rest${endpoint.startsWith('/') ? endpoint : '/' + endpoint}`;
+  private async syncRealRouter() {
+    if (this.isSyncing) return;
+    if (!this.config.host) return;
 
-    if (this.config.use_ssl && this.config.allow_insecure_cert) {
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-    }
-
-    const headers: Record<string, string> = {
-      Authorization: `Basic ${Buffer.from(`${this.config.username}:${this.config.password || ''}`).toString('base64')}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    };
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
-
-    const fetchOptions: any = {
-      method: options.method || 'GET',
-      headers,
-      signal: controller.signal,
-    };
-
-    if (options.body) {
-      fetchOptions.body = JSON.stringify(options.body);
-    }
-
+    this.isSyncing = true;
     try {
-      const res = await fetch(url, fetchOptions);
-      clearTimeout(timer);
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`RouterOS HTTP ${res.status}: ${errText || res.statusText}`);
+      // 1. Query system resource
+      const sys = await this.makeRouterOsRequest('/system/resource', { timeoutMs: 3500 });
+      if (sys) {
+        this.config.connected = true;
+        this.config.last_error = undefined;
+        this.config.last_sync = new Date().toISOString();
+
+        this.routerInfo.model = sys['board-name'] || sys.board_name || this.routerInfo.model;
+        this.routerInfo.routeros_version = sys.version || this.routerInfo.routeros_version;
+        if (sys['cpu-load'] !== undefined || sys.cpu_load !== undefined) {
+          this.routerInfo.cpu_load_percent = Number(sys['cpu-load'] ?? sys.cpu_load);
+        }
+        if (sys['free-memory']) {
+          this.routerInfo.free_memory_mb = Math.round(Number(sys['free-memory']) / (1024 * 1024));
+        }
+        if (sys['total-memory']) {
+          this.routerInfo.total_memory_mb = Math.round(Number(sys['total-memory']) / (1024 * 1024));
+        }
+        if (sys.uptime) {
+          this.routerInfo.uptime = String(sys.uptime);
+        }
       }
-      return await res.json();
+
+      // 2. Query interfaces and calculate live throughput
+      try {
+        const ifaces = await this.makeRouterOsRequest('/interface', { timeoutMs: 3000 });
+        if (Array.isArray(ifaces) && ifaces.length > 0) {
+          const now = Date.now();
+          let wanRxBps = 0;
+          let wanTxBps = 0;
+
+          const wanItem = ifaces.find((i: any) =>
+            i.comment?.toLowerCase().includes('wan') ||
+            i.name?.toLowerCase().includes('wan') ||
+            i.name?.toLowerCase().includes('ether1')
+          ) || ifaces[0];
+
+          if (wanItem && this.lastPollWanBytes) {
+            const dt = Math.max(0.5, (now - this.lastPollWanBytes.time) / 1000);
+            const curRx = Number(wanItem['rx-byte'] || 0);
+            const curTx = Number(wanItem['tx-byte'] || 0);
+            const dRx = Math.max(0, curRx - this.lastPollWanBytes.rx);
+            const dTx = Math.max(0, curTx - this.lastPollWanBytes.tx);
+            wanRxBps = Math.round((dRx * 8) / dt);
+            wanTxBps = Math.round((dTx * 8) / dt);
+          }
+
+          if (wanItem) {
+            this.lastPollWanBytes = {
+              rx: Number(wanItem['rx-byte'] || 0),
+              tx: Number(wanItem['tx-byte'] || 0),
+              time: now,
+            };
+          }
+
+          this.interfaces = ifaces.map((i: any) => ({
+            id: i['.id'] || i.id || String(Math.random()),
+            name: i.name,
+            type: i.type || 'ethernet',
+            mac_address: i['mac-address'] || '',
+            running: i.running === 'true' || i.running === true,
+            disabled: i.disabled === 'true' || i.disabled === true,
+            rx_bps: i.name === wanItem?.name ? wanRxBps : 0,
+            tx_bps: i.name === wanItem?.name ? wanTxBps : 0,
+            rx_packets_per_sec: Number(i['rx-packet'] || 0) % 1000,
+            tx_packets_per_sec: Number(i['tx-packet'] || 0) % 1000,
+            total_rx_bytes: Number(i['rx-byte'] || 0),
+            total_tx_bytes: Number(i['tx-byte'] || 0),
+            comment: i.comment || '',
+            is_wan: i.name === wanItem?.name,
+          }));
+
+          const d = new Date(now);
+          const time_label = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
+          this.throughputHistory.push({
+            timestamp: now,
+            time_label,
+            wan_rx_mbps: Number((wanRxBps / 1_000_000).toFixed(2)),
+            wan_tx_mbps: Number((wanTxBps / 1_000_000).toFixed(2)),
+            lan_rx_mbps: Number((wanTxBps * 0.95 / 1_000_000).toFixed(2)),
+            lan_tx_mbps: Number((wanRxBps * 0.95 / 1_000_000).toFixed(2)),
+          });
+          if (this.throughputHistory.length > 60) {
+            this.throughputHistory.shift();
+          }
+        }
+      } catch (ifErr) {
+        // continue
+      }
+
+      // Sync other tables every 3 polls (6 seconds) to avoid stressing router CPU
+      this.syncCount++;
+      if (this.syncCount % 3 === 0) {
+        try {
+          const [leases, addrLists, qs, fw, sch] = await Promise.all([
+            this.makeRouterOsRequest('/ip/dhcp-server/lease', { timeoutMs: 3500 }).catch(() => null),
+            this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3500 }).catch(() => null),
+            this.makeRouterOsRequest('/queue/simple', { timeoutMs: 3500 }).catch(() => null),
+            this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => null),
+            this.makeRouterOsRequest('/system/scheduler', { timeoutMs: 3500 }).catch(() => null),
+          ]);
+
+          if (Array.isArray(addrLists)) {
+            this.addressLists = addrLists.map((a: any) => ({
+              id: a['.id'] || a.id,
+              list: a.list || '',
+              address: a.address || '',
+              disabled: a.disabled === 'true' || a.disabled === true,
+              creation_time: a['creation-time'] || '',
+              dynamic: a.dynamic === 'true' || a.dynamic === true,
+              comment: a.comment || '',
+            }));
+          }
+
+          const blockedIps = new Set(
+            this.addressLists
+              .filter((a) => a.list === 'ha_blocked_users' && !a.disabled)
+              .map((a) => a.address)
+          );
+
+          if (Array.isArray(leases) && leases.length > 0) {
+            this.clients = leases.map((l: any, idx: number) => {
+              const ip = l['active-address'] || l.address;
+              const mac = l['active-mac-address'] || l['mac-address'] || '';
+              const host = l['active-host-name'] || l['host-name'] || l.comment || `Client-${ip?.split('.').slice(-1)[0]}`;
+              const isBlocked = blockedIps.has(ip);
+              return {
+                id: l['.id'] || `c-${idx}`,
+                hostname: host,
+                alias: l.comment || host,
+                ip_address: ip,
+                mac_address: mac,
+                vendor: 'Network Client',
+                interface: l['server'] || 'bridge',
+                connection_type: 'ethernet',
+                status: isBlocked ? 'blocked' : (l.status === 'bound' ? 'active' : 'idle'),
+                rx_rate_bps: isBlocked ? 0 : 500000,
+                tx_rate_bps: isBlocked ? 0 : 120000,
+                total_download_bytes: 1024 * 1024 * 50,
+                total_upload_bytes: 1024 * 1024 * 10,
+                uptime: l['last-seen'] || 'Active',
+                last_seen: 'Just now',
+                is_blocked: isBlocked,
+                block_method: 'firewall_address_list',
+                max_download_limit: isBlocked ? 'Blocked' : 'Uncapped',
+                max_upload_limit: isBlocked ? 'Blocked' : 'Uncapped',
+                schedules: [],
+                blocked_games: [],
+                blocked_websites: [],
+                custom_blocked_domains: [],
+                dhcp_status: l.status || 'bound',
+              };
+            });
+          }
+
+          if (Array.isArray(qs)) {
+            this.queues = qs.map((q: any) => {
+              const limits = (q['max-limit'] || '').split('/');
+              return {
+                id: q['.id'] || q.id,
+                name: q.name || '',
+                target: q.target || '',
+                max_limit_upload: limits[0] || '10M',
+                max_limit_download: limits[1] || '25M',
+                priority: Number(q.priority?.split('/')[0] || 5),
+                current_rate_upload_bps: Number(q.rate?.split('/')[0] || 0),
+                current_rate_download_bps: Number(q.rate?.split('/')[1] || 0),
+                total_bytes_upload: Number(q.bytes?.split('/')[0] || 0),
+                total_bytes_download: Number(q.bytes?.split('/')[1] || 0),
+                packet_drops: Number(q['total-packet-drops'] || 0),
+                disabled: q.disabled === 'true' || q.disabled === true,
+                dynamic: q.dynamic === 'true' || q.dynamic === true,
+                comment: q.comment || '',
+              };
+            });
+          }
+
+          if (Array.isArray(fw)) {
+            this.firewallRules = fw.map((r: any, idx: number) => ({
+              id: r['.id'] || `fw-${idx}`,
+              order: idx + 1,
+              chain: r.chain || 'forward',
+              action: r.action || 'accept',
+              src_address: r['src-address'],
+              dst_address: r['dst-address'],
+              src_address_list: r['src-address-list'],
+              dst_address_list: r['dst-address-list'],
+              protocol: r.protocol,
+              dst_port: r['dst-port'],
+              tls_host: r['tls-host'],
+              in_interface: r['in-interface'],
+              out_interface: r['out-interface'],
+              connection_state: r['connection-state'],
+              packets: Number(r.packets || 0),
+              bytes: Number(r.bytes || 0),
+              disabled: r.disabled === 'true' || r.disabled === true,
+              comment: r.comment || '',
+            }));
+          }
+
+          if (Array.isArray(sch)) {
+            this.schedules = sch.map((s: any) => ({
+              id: s['.id'] || s.id,
+              name: s.name,
+              start_date: s['start-date'] || '',
+              start_time: s['start-time'] || '',
+              interval: s.interval || '1d',
+              on_event: s['on-event'] || '',
+              run_count: Number(s['run-count'] || 0),
+              next_run: s['next-run'] || '',
+              disabled: s.disabled === 'true' || s.disabled === true,
+              comment: s.comment || '',
+            }));
+          }
+        } catch (subErr) {
+          // continue
+        }
+      }
     } catch (err: any) {
-      clearTimeout(timer);
-      throw err;
+      this.config.connected = false;
+      this.config.last_error = err.message || 'Cannot reach RouterOS REST API';
+    } finally {
+      this.isSyncing = false;
     }
+  }
+
+  // --- Real RouterOS REST API communication (RouterOS v7) ---
+  private async makeRouterOsRequest(
+    endpoint: string,
+    options: { method?: string; body?: any; timeoutMs?: number } = {}
+  ): Promise<any> {
+    if (!this.config.host) {
+      throw new Error('Router host IP is not configured');
+    }
+
+    const res = await doRouterRequest(
+      {
+        host: this.config.host,
+        port: this.config.port || (this.config.use_ssl ? 8443 : 80),
+        username: this.config.username || 'admin',
+        password: this.config.password || '',
+        use_ssl: this.config.use_ssl ?? true,
+        allow_insecure_cert: this.config.allow_insecure_cert ?? true,
+      },
+      endpoint,
+      options
+    );
+
+    if (res.status >= 400) {
+      const errDetail = typeof res.data === 'object' ? JSON.stringify(res.data) : res.raw || res.statusText;
+      throw new Error(`RouterOS HTTP ${res.status}: ${errDetail}`);
+    }
+
+    return res.data;
   }
 
   // --- Public API Methods ---
@@ -1021,150 +1328,199 @@ class MikroTikService {
     if (newConfig.use_ssl !== undefined) this.config.use_ssl = Boolean(newConfig.use_ssl);
     if (newConfig.allow_insecure_cert !== undefined) this.config.allow_insecure_cert = Boolean(newConfig.allow_insecure_cert);
     if (newConfig.poll_interval_ms !== undefined) this.config.poll_interval_ms = Number(newConfig.poll_interval_ms);
-    if (newConfig.mode !== undefined) this.config.mode = newConfig.mode;
+    this.config.mode = 'real';
 
-    if (this.config.mode === 'real') {
-      try {
-        const sysRes = await this.makeRouterOsRequest('/system/resource');
-        this.config.connected = true;
-        this.config.last_error = undefined;
-        this.config.last_sync = new Date().toISOString();
-        if (sysRes) {
-          this.routerInfo.model = sysRes.board_name || sysRes['board-name'] || this.routerInfo.model;
-          this.routerInfo.routeros_version = sysRes.version || this.routerInfo.routeros_version;
-          this.routerInfo.cpu_load_percent = Number(sysRes['cpu-load'] || 15);
-        }
-      } catch (err: any) {
-        this.config.connected = false;
-        this.config.last_error = err.message;
-      }
-    } else {
+    try {
+      const sysRes = await this.makeRouterOsRequest('/system/resource', { timeoutMs: 4000 });
       this.config.connected = true;
       this.config.last_error = undefined;
       this.config.last_sync = new Date().toISOString();
+      if (sysRes) {
+        this.routerInfo.model = sysRes['board-name'] || sysRes.board_name || this.routerInfo.model;
+        this.routerInfo.routeros_version = sysRes.version || this.routerInfo.routeros_version;
+        this.routerInfo.cpu_load_percent = Number(sysRes['cpu-load'] || sysRes.cpu_load || 15);
+      }
+    } catch (err: any) {
+      this.config.connected = false;
+      this.config.last_error = err.message;
     }
 
     return this.getConfig();
   }
 
   public async testConnection(testCfg: Partial<RouterConnectionConfig>) {
-    const merged = { ...this.config, ...testCfg };
-    if (merged.mode === 'demo') {
+    const host = (testCfg.host || this.config.host || '').trim();
+    const port = Number(testCfg.port || this.config.port || (testCfg.use_ssl ? 8443 : 80));
+    const username = (testCfg.username || this.config.username || 'admin').trim();
+    const password = testCfg.password !== undefined && testCfg.password !== '••••••••' ? testCfg.password : this.config.password;
+    const use_ssl = testCfg.use_ssl !== undefined ? Boolean(testCfg.use_ssl) : (this.config.use_ssl ?? true);
+    const allow_insecure_cert = testCfg.allow_insecure_cert !== undefined ? Boolean(testCfg.allow_insecure_cert) : true;
+
+    if (!host) {
       return {
-        success: true,
-        message: 'Simulator Mode verified: Live RouterBOARD emulation active with full telemetry.',
+        success: false,
+        message: 'Please provide a valid Router IP or Hostname.',
       };
     }
 
-    const host = (merged.host || '').trim();
-    const port = merged.port || (merged.use_ssl ? 8443 : 8282);
-    const protocol = merged.use_ssl ? 'https' : 'http';
     const isPrivate = isPrivateLanIp(host);
+    const testedUrl = `${use_ssl ? 'https' : 'http'}://${host}:${port}/rest/system/resource`;
 
-    if (merged.allow_insecure_cert) {
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-    }
-
-    // Probe TCP socket reachability first
+    // 1. Check TCP reachability first
     const isTcpOpen = await probePort(host, port, 3000);
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-
-    const url = `${protocol}://${host}:${port}/rest/system/resource`;
-    const headers: Record<string, string> = {
-      Authorization: `Basic ${Buffer.from(`${merged.username}:${merged.password || ''}`).toString('base64')}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    };
-
+    // 2. Perform REST request with self-signed cert support
     try {
-      const res = await fetch(url, {
-        method: 'GET',
-        headers,
-        signal: controller.signal,
-      });
+      const res = await doRouterRequest(
+        { host, port, username, password, use_ssl, allow_insecure_cert },
+        '/system/resource',
+        { timeoutMs: 5000 }
+      );
 
-      clearTimeout(timer);
-
-      if (!res.ok) {
-        const errText = await res.text();
+      if (res.status === 200 && res.data) {
+        const board = res.data['board-name'] || res.data.board_name || res.data.platform || 'MikroTik RouterBOARD';
+        const version = res.data.version || 'v7';
+        const cpu = res.data['cpu-load'] || res.data.cpu_load || 0;
         return {
-          success: false,
-          message: `RouterOS replied with HTTP ${res.status}: ${errText || res.statusText}`,
+          success: true,
+          message: `Connected successfully to ${board} running RouterOS ${version} (CPU: ${cpu}%)!`,
+          data: res.data,
           diagnosis: {
             is_private_ip: isPrivate,
-            tcp_open: isTcpOpen,
-            tested_url: url,
-            status_code: res.status,
-            recommendation:
-              res.status === 401
-                ? 'Authentication failed: Check RouterOS username and password in System > Users.'
-                : res.status === 404
-                ? 'Endpoint /rest/system/resource not found. Ensure RouterOS v7.1+ is installed.'
-                : 'Firewall or service configuration issue on RouterOS.',
+            tcp_open: true,
+            tested_url: testedUrl,
+            status_code: 200,
           },
         };
       }
 
-      const data = await res.json();
-      return {
-        success: true,
-        message: `Successfully connected to RouterOS ${data.version || 'v7'} on ${data['board-name'] || data.board_name || 'RouterBOARD'}!`,
-        data,
-      };
-    } catch (err: any) {
-      clearTimeout(timer);
+      if (res.status === 401) {
+        return {
+          success: false,
+          message: `HTTP 401 Unauthorized: RouterOS rejected username '${username}' or password. Please verify credentials in Winbox > System > Users.`,
+          diagnosis: {
+            is_private_ip: isPrivate,
+            tcp_open: true,
+            tested_url: testedUrl,
+            status_code: 401,
+            recommendation: 'Check username and password. By default, admin has no password or a custom password.',
+            actionable_solutions: [
+              {
+                title: 'Check MikroTik User Credentials',
+                badge: 'System > Users',
+                steps: [
+                  'Open Winbox and connect to your router.',
+                  'Navigate to System > Users.',
+                  `Confirm user '${username}' exists and check assigned group policies (must have read and api / rest policies).`,
+                  'Ensure the password matches what you entered.',
+                ],
+              },
+            ],
+          },
+        };
+      }
 
-      let errReason = err.message || 'Network request failed';
-      if (err.name === 'AbortError') {
-        errReason = 'Connection timed out after 5.0s';
+      if (res.status === 404) {
+        return {
+          success: false,
+          message: `HTTP 404 Not Found: Connected to web server at ${host}:${port}, but '/rest' API endpoint does not exist. Ensure your MikroTik is running RouterOS v7.1 or newer.`,
+          diagnosis: {
+            is_private_ip: isPrivate,
+            tcp_open: true,
+            tested_url: testedUrl,
+            status_code: 404,
+            recommendation: 'Upgrade RouterBOARD to RouterOS v7.1+ in System > Packages.',
+            actionable_solutions: [
+              {
+                title: 'Verify RouterOS Version',
+                badge: 'RouterOS v7+',
+                steps: [
+                  'RouterOS v6 does not include the modern REST API.',
+                  'Open Winbox > System > Packages and check version (must be v7.1 or newer).',
+                ],
+              },
+            ],
+          },
+        };
       }
 
       return {
         success: false,
-        message: `Connection failed: ${errReason}`,
+        message: `RouterOS replied with HTTP ${res.status}: ${res.raw || res.statusText}`,
         diagnosis: {
           is_private_ip: isPrivate,
           tcp_open: isTcpOpen,
-          tested_url: url,
+          tested_url: testedUrl,
+          status_code: res.status,
+        },
+      };
+    } catch (err: any) {
+      // If primary port failed, scan other common ports to give an actionable solution
+      const candidatePorts = [
+        { port: 8443, ssl: true, label: '8443 (www-ssl)' },
+        { port: 443, ssl: true, label: '443 (HTTPS)' },
+        { port: 80, ssl: false, label: '80 (HTTP)' },
+        { port: 8282, ssl: false, label: '8282 (www)' },
+      ].filter((p) => p.port !== port);
+
+      const probeResults = await Promise.all(
+        candidatePorts.map(async (c) => ({
+          ...c,
+          open: await probePort(host, c.port, 1500),
+        }))
+      );
+
+      const openCandidate = probeResults.find((c) => c.open);
+
+      let serviceHints: string[] = [];
+      let actionableSolutions: any[] = [];
+
+      if (openCandidate) {
+        serviceHints.push(
+          `Port ${port} is unreachable, but Port ${openCandidate.port} (${openCandidate.label}) IS OPEN and responding on ${host}!`
+        );
+        actionableSolutions.push({
+          title: `Switch to Detected Open Port ${openCandidate.port}`,
+          badge: openCandidate.ssl ? 'HTTPS (SSL)' : 'HTTP',
+          steps: [
+            `Change Port to ${openCandidate.port}.`,
+            openCandidate.ssl ? 'Ensure "Use HTTPS / SSL" is checked.' : 'Uncheck "Use HTTPS / SSL" (HTTP mode).',
+            'Click Test Connection again to verify.',
+          ],
+        });
+      } else {
+        serviceHints.push(
+          `No standard RouterOS web ports (8443, 443, 80, 8282) responded on '${host}'.`
+        );
+        if (isPrivate) {
+          serviceHints.push(
+            `'${host}' is an internal LAN address. In Home Assistant, this add-on runs directly inside your local network. Verify the router IP address matches your MikroTik gateway.`
+          );
+        }
+      }
+
+      actionableSolutions.push({
+        title: 'Check Winbox IP > Services',
+        badge: 'RouterOS Configuration',
+        steps: [
+          'In Winbox, go to IP > Services.',
+          `Ensure either 'www-ssl' (port 8443 or 443) or 'www' (port 80 or 8282) is ENABLED (not disabled).`,
+          'Check that "Available From" does not restrict connections from Home Assistant subnet.',
+        ],
+      });
+
+      return {
+        success: false,
+        message: `Connection failed to ${host}:${port} (${err.message || 'Network unreachable'})`,
+        diagnosis: {
+          is_private_ip: isPrivate,
+          tcp_open: isTcpOpen,
+          tested_url: testedUrl,
           host,
           port,
-          use_ssl: merged.use_ssl,
-          service_hints: [
-            'From your Services configuration: www-ssl is on port 8443, www is on port 8282, and api is on port 8728.',
-            isPrivate
-              ? `Host '${host}' is a private internal LAN address. Cloud preview containers cannot route into your home LAN across the public internet.`
-              : `Host '${host}' on port ${port} is unreachable or closed.`,
-          ],
-          actionable_solutions: [
-            {
-              title: 'Option 1: Deploy as Home Assistant Add-on (Recommended)',
-              badge: 'Local Home Network',
-              steps: [
-                'Download the Add-on ZIP from the "HA Add-on Hub" tab.',
-                'Extract to your Home Assistant /addons/mikrotik_manager directory.',
-                `Since Home Assistant runs inside your home network, it connects directly to ${host}:${port} on your local LAN with no cloud routing barriers.`,
-              ],
-            },
-            {
-              title: 'Option 2: Use MikroTik Cloud DDNS / Port Forwarding',
-              badge: 'Remote Cloud Access',
-              steps: [
-                'In Winbox, go to IP > Cloud and check "DDNS Enabled" to get your xxxxx.sn.mynetname.net hostname.',
-                `In IP > Firewall > NAT, forward port ${port} (e.g. 8443 or 8282) from your WAN interface.`,
-                'Enter your xxxxx.sn.mynetname.net hostname in the Router IP / Host field.',
-              ],
-            },
-            {
-              title: 'Option 3: Use Simulator Mode for Instant Preview',
-              badge: 'Interactive Testing',
-              steps: [
-                'Switch the Operational Mode to "Simulator Mode" in this dialog.',
-                'Enables full interactive preview with live throughput, queues, and filter shields.',
-              ],
-            },
-          ],
+          use_ssl,
+          service_hints: serviceHints,
+          actionable_solutions: actionableSolutions,
         },
       };
     }
@@ -1215,12 +1571,30 @@ class MikroTikService {
       } else {
         existing.disabled = false;
       }
+
+      if (this.config.connected) {
+        this.makeRouterOsRequest('/ip/firewall/address-list', {
+          method: 'POST',
+          body: {
+            list: 'ha_blocked_users',
+            address: client.ip_address,
+            comment: `Blocked via Home Assistant: ${client.alias || client.hostname}`,
+          },
+        }).catch(() => {});
+      }
     } else {
       const index = this.addressLists.findIndex(
         (a) => a.list === 'ha_blocked_users' && a.address === client.ip_address
       );
+      let removedEntry: AddressListEntry | undefined;
       if (index !== -1) {
-        this.addressLists.splice(index, 1);
+        removedEntry = this.addressLists.splice(index, 1)[0];
+      }
+
+      if (this.config.connected && removedEntry?.id) {
+        this.makeRouterOsRequest(`/ip/firewall/address-list/${removedEntry.id}`, {
+          method: 'DELETE',
+        }).catch(() => {});
       }
     }
 
@@ -1243,6 +1617,11 @@ class MikroTikService {
 
     if (maxDownload === 'Uncapped' || maxDownload === '0') {
       if (queue) {
+        if (this.config.connected && queue.id) {
+          this.makeRouterOsRequest(`/queue/simple/${queue.id}`, {
+            method: 'DELETE',
+          }).catch(() => {});
+        }
         this.queues = this.queues.filter((q) => q.id !== queue!.id);
       }
       client.queue_id = undefined;
@@ -1265,10 +1644,32 @@ class MikroTikService {
           comment: `Bandwidth limit set via Home Assistant for ${client.alias || client.hostname}`,
         };
         this.queues.push(queue);
+
+        if (this.config.connected) {
+          this.makeRouterOsRequest('/queue/simple', {
+            method: 'POST',
+            body: {
+              name: queue.name,
+              target: targetSubnet,
+              'max-limit': `${maxUpload}/${maxDownload}`,
+              comment: queue.comment,
+            },
+          }).catch(() => {});
+        }
       } else {
         queue.max_limit_download = maxDownload;
         queue.max_limit_upload = maxUpload;
         queue.disabled = false;
+
+        if (this.config.connected && queue.id) {
+          this.makeRouterOsRequest(`/queue/simple/${queue.id}`, {
+            method: 'PATCH',
+            body: {
+              'max-limit': `${maxUpload}/${maxDownload}`,
+              disabled: 'false',
+            },
+          }).catch(() => {});
+        }
       }
       client.queue_id = queue.id;
     }

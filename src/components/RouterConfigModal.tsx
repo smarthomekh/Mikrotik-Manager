@@ -47,7 +47,6 @@ interface RouterConfigModalProps {
   config: RouterConnectionConfig;
   onSave: (newCfg: Partial<RouterConnectionConfig>) => Promise<void>;
   onTest: (cfg: Partial<RouterConnectionConfig>) => Promise<TestConnectionResult>;
-  onSwitchToSimulator?: () => void;
 }
 
 // Preset ports based on user's Winbox /ip/service setup
@@ -56,28 +55,28 @@ const PORT_PRESETS = [
     port: 8443,
     ssl: true,
     label: '8443 (www-ssl)',
-    desc: 'RouterOS HTTPS REST (Active in Winbox)',
+    desc: 'RouterOS HTTPS REST (Standard SSL)',
     isRecommended: true,
+  },
+  {
+    port: 443,
+    ssl: true,
+    label: '443 (HTTPS)',
+    desc: 'Standard Web-SSL Service',
+    isRecommended: false,
+  },
+  {
+    port: 80,
+    ssl: false,
+    label: '80 (HTTP)',
+    desc: 'Default RouterOS Web Port',
+    isRecommended: false,
   },
   {
     port: 8282,
     ssl: false,
     label: '8282 (www)',
-    desc: 'RouterOS HTTP REST (Active in Winbox)',
-    isRecommended: false,
-  },
-  {
-    port: 443,
-    ssl: true,
-    label: '443 (Reverse-Proxy)',
-    desc: 'Winbox Reverse-Proxy service',
-    isRecommended: false,
-  },
-  {
-    port: 8728,
-    ssl: false,
-    label: '8728 (api)',
-    desc: 'Binary API socket (Active, restricted IP)',
+    desc: 'Custom HTTP REST Port',
     isRecommended: false,
   },
 ];
@@ -88,7 +87,6 @@ export const RouterConfigModal: React.FC<RouterConfigModalProps> = ({
   config,
   onSave,
   onTest,
-  onSwitchToSimulator,
 }) => {
   const [formData, setFormData] = useState<Partial<RouterConnectionConfig>>({
     host: config.host || '192.168.99.1',
@@ -97,7 +95,7 @@ export const RouterConfigModal: React.FC<RouterConfigModalProps> = ({
     password: '',
     use_ssl: config.use_ssl !== undefined ? config.use_ssl : true,
     allow_insecure_cert: config.allow_insecure_cert !== undefined ? config.allow_insecure_cert : true,
-    mode: config.mode || 'real',
+    mode: 'real',
     poll_interval_ms: config.poll_interval_ms || 1000,
   });
 
@@ -128,7 +126,7 @@ export const RouterConfigModal: React.FC<RouterConfigModalProps> = ({
     e.preventDefault();
     setIsSaving(true);
     try {
-      await onSave(formData);
+      await onSave({ ...formData, mode: 'real' });
       onClose();
     } finally {
       setIsSaving(false);
@@ -142,17 +140,6 @@ export const RouterConfigModal: React.FC<RouterConfigModalProps> = ({
       use_ssl: preset.ssl,
       allow_insecure_cert: preset.ssl ? true : prev.allow_insecure_cert,
     }));
-  };
-
-  const handleEnableSimulator = async () => {
-    const updated: Partial<RouterConnectionConfig> = {
-      ...formData,
-      mode: 'demo',
-    };
-    setFormData(updated);
-    await onSave(updated);
-    if (onSwitchToSimulator) onSwitchToSimulator();
-    onClose();
   };
 
   const isLanIp =
@@ -180,7 +167,7 @@ export const RouterConfigModal: React.FC<RouterConfigModalProps> = ({
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
-                Connect directly to your MikroTik RouterBOARD or test via Interactive Simulator
+                Connect directly to your MikroTik RouterBOARD via REST API
               </p>
             </div>
           </div>
@@ -193,59 +180,6 @@ export const RouterConfigModal: React.FC<RouterConfigModalProps> = ({
         </div>
 
         <form onSubmit={handleSave} className="p-6 space-y-5 max-h-[80vh] overflow-y-auto">
-          {/* Operation Mode Selector */}
-          <div>
-            <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
-              Operational Mode
-            </label>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <button
-                type="button"
-                onClick={() => setFormData({ ...formData, mode: 'real' })}
-                className={`flex flex-col items-start p-3.5 rounded-lg border text-left transition-all ${
-                  formData.mode === 'real'
-                    ? 'border-sky-500 bg-sky-500/10 text-white shadow-sm shadow-sky-500/10 ring-1 ring-sky-500/50'
-                    : 'border-slate-800 bg-slate-950/40 text-slate-400 hover:border-slate-700 hover:text-slate-200'
-                }`}
-              >
-                <div className="flex items-center justify-between w-full mb-1">
-                  <div className="flex items-center gap-2">
-                    <Server className="w-4 h-4 text-sky-400" />
-                    <span className="text-sm font-semibold text-white">Live RouterOS Device</span>
-                  </div>
-                  {formData.mode === 'real' && (
-                    <span className="w-2 h-2 rounded-full bg-sky-400 animate-pulse"></span>
-                  )}
-                </div>
-                <span className="text-xs text-slate-400 leading-relaxed">
-                  Real REST API calls to your MikroTik RouterBOARD (/rest/queue, /ip/firewall, /interface).
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setFormData({ ...formData, mode: 'demo' })}
-                className={`flex flex-col items-start p-3.5 rounded-lg border text-left transition-all ${
-                  formData.mode === 'demo'
-                    ? 'border-emerald-500 bg-emerald-500/10 text-white shadow-sm shadow-emerald-500/10 ring-1 ring-emerald-500/50'
-                    : 'border-slate-800 bg-slate-950/40 text-slate-400 hover:border-slate-700 hover:text-slate-200'
-                }`}
-              >
-                <div className="flex items-center justify-between w-full mb-1">
-                  <div className="flex items-center gap-2">
-                    <Radio className="w-4 h-4 text-emerald-400" />
-                    <span className="text-sm font-semibold text-white">Simulator Mode</span>
-                  </div>
-                  {formData.mode === 'demo' && (
-                    <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                  )}
-                </div>
-                <span className="text-xs text-slate-400 leading-relaxed">
-                  Instant live emulation with synthetic throughput, queues, schedules, and game filtering.
-                </span>
-              </button>
-            </div>
-          </div>
 
           {/* Router Address & Port */}
           <div className="space-y-3">
@@ -483,16 +417,6 @@ export const RouterConfigModal: React.FC<RouterConfigModalProps> = ({
                                 <li key={sIdx} className="leading-relaxed">{st}</li>
                               ))}
                             </ul>
-                            {sol.title.includes('Simulator Mode') && (
-                              <button
-                                type="button"
-                                onClick={handleEnableSimulator}
-                                className="mt-2 w-full py-1.5 px-3 rounded bg-emerald-600/30 hover:bg-emerald-600/40 border border-emerald-500/40 text-emerald-300 font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors"
-                              >
-                                <Radio className="w-3.5 h-3.5 text-emerald-400" />
-                                1-Click: Switch to Simulator Mode Now
-                              </button>
-                            )}
                           </div>
                         ))}
                       </div>
