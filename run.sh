@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-set -eu
+set -e
 
 echo "[MikroTik Manager] Starting MikroTik Gateway Manager v1.3.5 (Home Assistant & CasaOS)..."
 
@@ -17,16 +17,19 @@ export NODE_ENV=production
 cd /app
 
 if [ -f "dist/server.js" ]; then
+    echo "[MikroTik Manager] Launching pre-built production server on port ${PORT}..."
     exec node dist/server.js
-fi
-
-if [ -f "server.js" ]; then
+elif [ -f "server.js" ]; then
+    echo "[MikroTik Manager] Launching server.js on port ${PORT}..."
     exec node server.js
-fi
-
-if [ -f "server.ts" ]; then
+elif [ -f "server.ts" ]; then
+    echo "[MikroTik Manager] Attempting to run server.ts with tsx on port ${PORT}..."
     exec npx tsx server.ts
+else
+    echo "================================================================================"
+    echo "[MikroTik Manager] CRITICAL ERROR: No executable entrypoint found in /app!"
+    echo "Expected 'dist/server.js' or 'server.ts'."
+    echo "Please ensure your repository includes the compiled 'dist/' directory."
+    echo "================================================================================"
+    exit 1
 fi
-
-echo "[MikroTik Manager] No application entrypoint was found in /app. The container was started successfully, but there is nothing to run."
-exec tail -f /dev/null

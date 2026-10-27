@@ -1,0 +1,6 @@
+{
+  "name": "MikroTik Manager for Home Assistant",
+  "description": "Home Assistant add-on and dashboard to manage MikroTik RouterOS queues, schedules, firewall rules, client bandwidth, parental access controls, and real-time interface throughput.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

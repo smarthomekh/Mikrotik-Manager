@@ -13,13 +13,13 @@ services:
       - "3000:3000"
     environment:
       - PORT=3000
-      - ROUTER_HOST=192.168.88.1
-      - ROUTER_PORT=443
+      - ROUTER_HOST=192.168.99.1
+      - ROUTER_PORT=8443
       - ROUTER_USER=admin
       - ROUTER_PASSWORD=
       - USE_SSL=true
       - ALLOW_INSECURE_CERT=true
-      - DEMO_MODE=true
+      - DEMO_MODE=false
     volumes:
       - /DATA/AppData/mikrotik-manager/data:/data
     x-casaos:
@@ -32,7 +32,7 @@ services:
             en_us: "RouterOS REST API port (8443 for HTTPS or 8282/80 for HTTP)"
         - container: ROUTER_USER
           description:
-            en_us: "RouterOS admin username"
+            en_us: "RouterOS admin username (e.g. admin)"
         - container: ROUTER_PASSWORD
           description:
             en_us: "RouterOS password"
@@ -41,18 +41,18 @@ services:
             en_us: "Enable SSL HTTPS connection (true/false)"
         - container: ALLOW_INSECURE_CERT
           description:
-            en_us: "Accept self-signed router certificate (true/false)"
+            en_us: "Allow self-signed router SSL certificate (true/false)"
         - container: DEMO_MODE
           description:
             en_us: "Enable demo simulation mode (false for live router)"
       ports:
         - container: "3000"
           description:
-            en_us: "MikroTik Manager Web Interface Port"
+            en_us: "MikroTik Manager Web UI"
       volumes:
         - container: /data
           description:
-            en_us: "Persistent storage directory for router settings and client rules"
+            en_us: "Persistent storage for schedules, blocked games, and rules"
 
 x-casaos:
   architectures:
