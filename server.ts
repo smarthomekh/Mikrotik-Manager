@@ -419,7 +419,19 @@ async function startServer() {
     const distPath = candidatePaths.find((p) => fs.existsSync(path.resolve(p, 'index.html'))) || path.resolve(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
-      res.sendFile(path.resolve(distPath, 'index.html'));
+      const indexPath = path.resolve(distPath, 'index.html');
+      if (!fs.existsSync(indexPath)) {
+        return res.status(404).send('Not Found');
+      }
+      const ingressPath = (req.headers['x-ingress-path'] as string) || '';
+      if (ingressPath) {
+        let html = fs.readFileSync(indexPath, 'utf-8');
+        const injection = `<script>window.__INGRESS_PATH__ = "${ingressPath}";</script><base href="${ingressPath}/">`;
+        html = html.replace('<head>', `<head>${injection}`);
+        res.setHeader('Content-Type', 'text/html');
+        return res.send(html);
+      }
+      res.sendFile(indexPath);
     });
   }
 

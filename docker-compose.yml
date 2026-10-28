@@ -14,10 +14,10 @@ services:
     environment:
       - PORT=3000
       - ROUTER_HOST=192.168.99.1
-      - ROUTER_PORT=8443
+      - ROUTER_PORT=80
       - ROUTER_USER=admin
       - ROUTER_PASSWORD=
-      - USE_SSL=true
+      - USE_SSL=false
       - ALLOW_INSECURE_CERT=true
       - DEMO_MODE=false
     volumes:

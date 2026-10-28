@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { AlertTriangle } from 'lucide-react';
+import { apiFetch } from './utils/api.ts';
 import { ClientsTab } from './components/ClientsTab.tsx';
 import { ContentFilterModal } from './components/ContentFilterModal.tsx';
 import { ContentFilterTab } from './components/ContentFilterTab.tsx';
@@ -62,7 +62,7 @@ export default function App() {
   useEffect(() => {
     const fetchThroughput = async () => {
       try {
-        const res = await fetch('/api/throughput');
+        const res = await apiFetch('/api/throughput');
         if (res.ok) {
           const data = await res.json();
           if (data.success) {
@@ -87,11 +87,11 @@ export default function App() {
     try {
       const [statusRes, clientsRes, queuesRes, schedulesRes, fwRes] =
         await Promise.all([
-          fetch('/api/status').then((r) => r.json()),
-          fetch('/api/clients').then((r) => r.json()),
-          fetch('/api/queues').then((r) => r.json()),
-          fetch('/api/schedules').then((r) => r.json()),
-          fetch('/api/firewall').then((r) => r.json()),
+          apiFetch('/api/status').then((r) => r.json()),
+          apiFetch('/api/clients').then((r) => r.json()),
+          apiFetch('/api/queues').then((r) => r.json()),
+          apiFetch('/api/schedules').then((r) => r.json()),
+          apiFetch('/api/firewall').then((r) => r.json()),
         ]);
 
       if (statusRes?.success) {
@@ -121,7 +121,7 @@ export default function App() {
   // Actions: Clients Block & Speed
   const handleBlockClient = async (ip: string, block: boolean) => {
     try {
-      const res = await fetch(`/api/clients/${ip}/block`, {
+      const res = await apiFetch(`/api/clients/${ip}/block`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ block }),
@@ -133,7 +133,7 @@ export default function App() {
             c.ip_address === ip ? { ...c, is_blocked: block, status: block ? 'blocked' : 'active' } : c
           )
         );
-        const fwRes = await fetch('/api/firewall').then((r) => r.json());
+        const fwRes = await apiFetch('/api/firewall').then((r) => r.json());
         if (fwRes?.success) setAddressLists(fwRes.address_lists || []);
       }
     } catch (err) {
@@ -143,7 +143,7 @@ export default function App() {
 
   const handleSaveSpeed = async (ip: string, maxDownload: string, maxUpload: string) => {
     try {
-      const res = await fetch(`/api/clients/${ip}/speed`, {
+      const res = await apiFetch(`/api/clients/${ip}/speed`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ maxDownload, maxUpload }),
@@ -157,7 +157,7 @@ export default function App() {
               : c
           )
         );
-        const qRes = await fetch('/api/queues').then((r) => r.json());
+        const qRes = await apiFetch('/api/queues').then((r) => r.json());
         if (qRes?.success) setQueues(qRes.queues);
       }
     } catch (err) {
@@ -168,7 +168,7 @@ export default function App() {
   // Actions: Multiple Restriction Time Slots
   const handleSaveClientSchedules = async (ip: string, schedules: RestrictionTimeSlot[]) => {
     try {
-      const res = await fetch(`/api/clients/${ip}/schedules`, {
+      const res = await apiFetch(`/api/clients/${ip}/schedules`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ schedules }),
@@ -187,7 +187,7 @@ export default function App() {
   // Actions: Games & Website Filtering
   const handleSaveClientGames = async (ip: string, games: string[]) => {
     try {
-      const res = await fetch(`/api/clients/${ip}/games`, {
+      const res = await apiFetch(`/api/clients/${ip}/games`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ games }),
@@ -198,7 +198,7 @@ export default function App() {
           prev.map((c) => (c.ip_address === ip ? { ...c, blocked_games: games } : c))
         );
         // Refresh firewall rules to reflect RouterOS tls-host drop rules
-        const fwRes = await fetch('/api/firewall').then((r) => r.json());
+        const fwRes = await apiFetch('/api/firewall').then((r) => r.json());
         if (fwRes?.success) setFirewallRules(fwRes.filter || []);
       }
     } catch (err) {
@@ -212,7 +212,7 @@ export default function App() {
     customDomains: string[]
   ) => {
     try {
-      const res = await fetch(`/api/clients/${ip}/websites`, {
+      const res = await apiFetch(`/api/clients/${ip}/websites`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ websites, customDomains }),
@@ -226,7 +226,7 @@ export default function App() {
               : c
           )
         );
-        const fwRes = await fetch('/api/firewall').then((r) => r.json());
+        const fwRes = await apiFetch('/api/firewall').then((r) => r.json());
         if (fwRes?.success) setFirewallRules(fwRes.filter || []);
       }
     } catch (err) {
@@ -259,7 +259,7 @@ export default function App() {
 
   const handleUpdateAlias = async (ip: string, alias: string) => {
     try {
-      const res = await fetch(`/api/clients/${ip}/alias`, {
+      const res = await apiFetch(`/api/clients/${ip}/alias`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ alias }),
@@ -279,7 +279,7 @@ export default function App() {
   const handleTogglePanic = async () => {
     const nextState = !panicActive;
     try {
-      const res = await fetch('/api/firewall/killswitch', {
+      const res = await apiFetch('/api/firewall/killswitch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ active: nextState }),
@@ -287,7 +287,7 @@ export default function App() {
       const data = await res.json();
       if (data.success) {
         setPanicActive(nextState);
-        const fwRes = await fetch('/api/firewall').then((r) => r.json());
+        const fwRes = await apiFetch('/api/firewall').then((r) => r.json());
         if (fwRes?.success) setFirewallRules(fwRes.filter || []);
       }
     } catch (err) {
@@ -299,7 +299,7 @@ export default function App() {
   const handleSaveQueue = async (queueData: Partial<SimpleQueue>) => {
     try {
       if (queueModalData?.id) {
-        const res = await fetch(`/api/queues/${queueModalData.id}`, {
+        const res = await apiFetch(`/api/queues/${queueModalData.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(queueData),
@@ -309,7 +309,7 @@ export default function App() {
           setQueues((prev) => prev.map((q) => (q.id === data.queue.id ? data.queue : q)));
         }
       } else {
-        const res = await fetch('/api/queues', {
+        const res = await apiFetch('/api/queues', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(queueData),
@@ -326,7 +326,7 @@ export default function App() {
 
   const handleToggleQueue = async (id: string, disabled: boolean) => {
     try {
-      const res = await fetch(`/api/queues/${id}`, {
+      const res = await apiFetch(`/api/queues/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ disabled }),
@@ -342,7 +342,7 @@ export default function App() {
 
   const handleDeleteQueue = async (id: string) => {
     try {
-      const res = await fetch(`/api/queues/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/queues/${id}`, { method: 'DELETE' });
       const data = await res.json();
       if (data.success) {
         setQueues((prev) => prev.filter((q) => q.id !== id));
@@ -356,7 +356,7 @@ export default function App() {
   const handleSaveRouterSchedule = async (schData: Partial<RouterSchedule>) => {
     try {
       if (scheduleModalData?.id) {
-        const res = await fetch(`/api/schedules/${scheduleModalData.id}`, {
+        const res = await apiFetch(`/api/schedules/${scheduleModalData.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(schData),
@@ -366,7 +366,7 @@ export default function App() {
           setSchedules((prev) => prev.map((s) => (s.id === data.schedule.id ? data.schedule : s)));
         }
       } else {
-        const res = await fetch('/api/schedules', {
+        const res = await apiFetch('/api/schedules', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(schData),
@@ -383,7 +383,7 @@ export default function App() {
 
   const handleToggleRouterSchedule = async (id: string, disabled: boolean) => {
     try {
-      const res = await fetch(`/api/schedules/${id}`, {
+      const res = await apiFetch(`/api/schedules/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ disabled }),
@@ -399,7 +399,7 @@ export default function App() {
 
   const handleDeleteRouterSchedule = async (id: string) => {
     try {
-      const res = await fetch(`/api/schedules/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/schedules/${id}`, { method: 'DELETE' });
       const data = await res.json();
       if (data.success) {
         setSchedules((prev) => prev.filter((s) => s.id !== id));
@@ -411,7 +411,7 @@ export default function App() {
 
   const handleRunScheduleNow = async (id: string) => {
     try {
-      const res = await fetch(`/api/schedules/${id}/run`, { method: 'POST' });
+      const res = await apiFetch(`/api/schedules/${id}/run`, { method: 'POST' });
       const data = await res.json();
       if (data.success) {
         setSchedules((prev) =>
@@ -426,7 +426,7 @@ export default function App() {
   // Actions: Firewall Filter Rules
   const handleSaveFirewallRule = async (ruleData: Partial<FirewallFilterRule>) => {
     try {
-      const res = await fetch('/api/firewall/filter', {
+      const res = await apiFetch('/api/firewall/filter', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(ruleData),
@@ -442,7 +442,7 @@ export default function App() {
 
   const handleToggleFirewallRule = async (id: string, disabled: boolean) => {
     try {
-      const res = await fetch(`/api/firewall/filter/${id}`, {
+      const res = await apiFetch(`/api/firewall/filter/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ disabled }),
@@ -458,7 +458,7 @@ export default function App() {
 
   const handleDeleteFirewallRule = async (id: string) => {
     try {
-      const res = await fetch(`/api/firewall/filter/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/firewall/filter/${id}`, { method: 'DELETE' });
       const data = await res.json();
       if (data.success) {
         setFirewallRules((prev) => prev.filter((r) => r.id !== id));
@@ -474,7 +474,7 @@ export default function App() {
 
   // Actions: Router Configuration
   const handleSaveConfig = async (newCfg: Partial<RouterConnectionConfig>) => {
-    const res = await fetch('/api/config', {
+    const res = await apiFetch('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newCfg),
@@ -487,7 +487,7 @@ export default function App() {
   };
 
   const handleTestConnection = async (testCfg: Partial<RouterConnectionConfig>) => {
-    const res = await fetch('/api/test-connection', {
+    const res = await apiFetch('/api/test-connection', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(testCfg),
