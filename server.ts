@@ -16,50 +16,65 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Auto-load Home Assistant Add-on configuration from /data/options.json, CasaOS /data/config.json, or environment
+  // Auto-load Home Assistant Add-on configuration and persistent UI settings
+  const candidateConfigPaths = [
+    '/data/config.json',
+    path.resolve(process.cwd(), 'data', 'config.json'),
+  ];
+  let savedConfig: any = null;
+  for (const cp of candidateConfigPaths) {
+    if (fs.existsSync(cp)) {
+      try {
+        const raw = fs.readFileSync(cp, 'utf-8');
+        savedConfig = JSON.parse(raw);
+        console.log(`[MikroTik Manager] Loaded saved router configuration from ${cp}`);
+        break;
+      } catch (err) {}
+    }
+  }
+
   const HA_OPTIONS_PATH = '/data/options.json';
-  const CASA_CONFIG_PATH = '/data/config.json';
+  let haOptions: any = null;
   if (fs.existsSync(HA_OPTIONS_PATH)) {
     try {
       const raw = fs.readFileSync(HA_OPTIONS_PATH, 'utf-8');
-      const opts = JSON.parse(raw);
-      console.log('[Home Assistant] Auto-configuring from /data/options.json:', {
-        router_host: opts.router_host,
-        router_port: opts.router_port,
-        router_user: opts.router_user,
-        use_ssl: opts.use_ssl,
-      });
-      await mikrotikService.setConfig({
-        host: opts.router_host || undefined,
-        port: opts.router_port ? Number(opts.router_port) : undefined,
-        username: opts.router_user || undefined,
-        password: opts.router_password || undefined,
-        use_ssl: opts.use_ssl !== undefined ? Boolean(opts.use_ssl) : undefined,
-        allow_insecure_cert: opts.allow_insecure_cert !== undefined ? Boolean(opts.allow_insecure_cert) : undefined,
-        mode: 'real',
-      });
+      haOptions = JSON.parse(raw);
+      console.log('[Home Assistant] Found options.json at /data/options.json');
     } catch (e) {
       console.warn('[Home Assistant] Failed to read /data/options.json:', e);
     }
-  } else if (fs.existsSync(CASA_CONFIG_PATH)) {
-    try {
-      const raw = fs.readFileSync(CASA_CONFIG_PATH, 'utf-8');
-      const saved = JSON.parse(raw);
-      console.log('[CasaOS / Standalone] Restoring saved router config from /data/config.json:', saved.host);
-      await mikrotikService.setConfig(saved);
-    } catch (e) {
-      console.warn('[CasaOS] Failed to read /data/config.json:', e);
-    }
-  } else if (process.env.ROUTER_HOST) {
-    console.log('[CasaOS / Environment] Configuring router from environment variables:', process.env.ROUTER_HOST);
+  }
+
+  const mergedConfig: any = {};
+  if (savedConfig) {
+    Object.assign(mergedConfig, savedConfig);
+  }
+  if (haOptions) {
+    if (haOptions.router_host) mergedConfig.host = haOptions.router_host;
+    if (haOptions.router_port) mergedConfig.port = Number(haOptions.router_port);
+    if (haOptions.router_user) mergedConfig.username = haOptions.router_user;
+    if (haOptions.router_password) mergedConfig.password = haOptions.router_password;
+    if (haOptions.use_ssl !== undefined) mergedConfig.use_ssl = Boolean(haOptions.use_ssl);
+    if (haOptions.allow_insecure_cert !== undefined) mergedConfig.allow_insecure_cert = Boolean(haOptions.allow_insecure_cert);
+  }
+  if (process.env.ROUTER_HOST && !mergedConfig.host) {
+    mergedConfig.host = process.env.ROUTER_HOST;
+    if (process.env.ROUTER_PORT) mergedConfig.port = Number(process.env.ROUTER_PORT);
+    if (process.env.ROUTER_USER) mergedConfig.username = process.env.ROUTER_USER;
+    if (process.env.ROUTER_PASSWORD) mergedConfig.password = process.env.ROUTER_PASSWORD;
+    if (process.env.USE_SSL !== undefined) mergedConfig.use_ssl = process.env.USE_SSL === 'true' || process.env.USE_SSL === '1';
+  }
+
+  if (mergedConfig.host) {
+    console.log('[MikroTik Manager] Initializing router connection with:', {
+      host: mergedConfig.host,
+      port: mergedConfig.port,
+      user: mergedConfig.username,
+      use_ssl: mergedConfig.use_ssl,
+    });
     await mikrotikService.setConfig({
-      host: process.env.ROUTER_HOST,
-      port: process.env.ROUTER_PORT ? Number(process.env.ROUTER_PORT) : undefined,
-      username: process.env.ROUTER_USER,
-      password: process.env.ROUTER_PASSWORD,
-      use_ssl: process.env.USE_SSL === 'true' || process.env.USE_SSL === '1',
-      allow_insecure_cert: process.env.ALLOW_INSECURE_CERT !== 'false',
-      mode: process.env.DEMO_MODE === 'true' ? 'demo' : 'real',
+      ...mergedConfig,
+      mode: 'real',
     });
   }
 
@@ -93,12 +108,13 @@ async function startServer() {
   app.post('/api/config', async (req, res) => {
     try {
       const updated = await mikrotikService.setConfig(req.body);
-      try {
-        if (fs.existsSync('/data')) {
-          fs.writeFileSync('/data/config.json', JSON.stringify(updated, null, 2), 'utf-8');
-        }
-      } catch (saveErr) {
-        // volume may not be writable, continue safely
+      const paths = ['/data/config.json', path.resolve(process.cwd(), 'data', 'config.json')];
+      for (const p of paths) {
+        try {
+          const dir = path.dirname(p);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(p, JSON.stringify(updated, null, 2), 'utf-8');
+        } catch {}
       }
       res.json({ success: true, config: updated });
     } catch (err: any) {
@@ -115,17 +131,26 @@ async function startServer() {
     }
   });
 
-  // Throughput & Interfaces
+  // Live Throughput, Interfaces, Clients & Telemetry
   app.get('/api/throughput', (req, res) => {
     try {
       const interfaces = mikrotikService.getInterfaces();
       const wan = interfaces.find((i) => i.is_wan) || interfaces[0];
       const history = mikrotikService.getThroughputHistory();
+      const clients = mikrotikService.getClients();
+      const queues = mikrotikService.getQueues();
+      const status = mikrotikService.getRouterInfo();
+      const config = mikrotikService.getConfig();
+
       res.json({
         success: true,
         wan,
         interfaces,
         history,
+        clients,
+        queues,
+        status,
+        config,
       });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message });
@@ -262,36 +287,36 @@ async function startServer() {
     }
   });
 
-  app.post('/api/schedules', (req, res) => {
+  app.post('/api/schedules', async (req, res) => {
     try {
-      const schedule = mikrotikService.createSchedule(req.body);
+      const schedule = await mikrotikService.createSchedule(req.body);
       res.json({ success: true, schedule });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.put('/api/schedules/:id', (req, res) => {
+  app.put('/api/schedules/:id', async (req, res) => {
     try {
-      const schedule = mikrotikService.updateSchedule(req.params.id, req.body);
+      const schedule = await mikrotikService.updateSchedule(req.params.id, req.body);
       res.json({ success: true, schedule });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.delete('/api/schedules/:id', (req, res) => {
+  app.delete('/api/schedules/:id', async (req, res) => {
     try {
-      const removed = mikrotikService.deleteSchedule(req.params.id);
+      const removed = await mikrotikService.deleteSchedule(req.params.id);
       res.json({ success: true, removed });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.post('/api/schedules/:id/run', (req, res) => {
+  app.post('/api/schedules/:id/run', async (req, res) => {
     try {
-      const result = mikrotikService.runScheduleNow(req.params.id);
+      const result = await mikrotikService.runScheduleNow(req.params.id);
       res.json(result);
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });

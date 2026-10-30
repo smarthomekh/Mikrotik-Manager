@@ -58,8 +58,9 @@ export default function App() {
   const [isScheduleModalOpen, setIsScheduleModalOpen] = useState(false);
   const [isFirewallModalOpen, setIsFirewallModalOpen] = useState(false);
 
-  // Fetch live throughput every 1 second
+  // Fetch live throughput, client devices, queues, and telemetry continuously every 1 second
   useEffect(() => {
+    let timer: NodeJS.Timeout;
     const fetchThroughput = async () => {
       try {
         const res = await apiFetch('/api/throughput');
@@ -69,16 +70,36 @@ export default function App() {
             setWanInterface(data.wan);
             setInterfaces(data.interfaces || []);
             setThroughputHistory(data.history || []);
+            if (data.clients) setClients(data.clients);
+            if (data.queues) setQueues(data.queues);
+            if (data.status) setRouterInfo(data.status);
+            if (data.config) setRouterConfig(data.config);
           }
         }
       } catch (err) {
-        console.error('Failed to poll throughput:', err);
+        console.error('Failed to poll live telemetry:', err);
       }
     };
 
     fetchThroughput();
-    const interval = setInterval(fetchThroughput, 1000);
-    return () => clearInterval(interval);
+    timer = setInterval(fetchThroughput, 1000);
+
+    // Refresh firewall rules periodically to show updated packet and byte hit counts
+    const fwInterval = setInterval(async () => {
+      try {
+        const fwRes = await apiFetch('/api/firewall').then((r) => r.json());
+        if (fwRes?.success) {
+          setFirewallRules(fwRes.filter || []);
+          setAddressLists(fwRes.address_lists || []);
+          setNatRules(fwRes.nat || []);
+        }
+      } catch {}
+    }, 4000);
+
+    return () => {
+      clearInterval(timer);
+      clearInterval(fwInterval);
+    };
   }, []);
 
   // Fetch all core router entities

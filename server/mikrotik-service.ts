@@ -69,13 +69,43 @@ function probePort(host: string, port: number, timeoutMs = 2500): Promise<boolea
   });
 }
 
+function sanitizeHost(rawHost: string): { host: string; port?: number; ssl?: boolean } {
+  if (!rawHost) return { host: '' };
+  let clean = rawHost.trim();
+  let ssl: boolean | undefined = undefined;
+  if (clean.startsWith('https://')) {
+    clean = clean.replace('https://', '');
+    ssl = true;
+  } else if (clean.startsWith('http://')) {
+    clean = clean.replace('http://', '');
+    ssl = false;
+  }
+  clean = clean.replace(/\/.*$/, '');
+  let port: number | undefined = undefined;
+  if (clean.includes(':')) {
+    const parts = clean.split(':');
+    clean = parts[0];
+    const p = parseInt(parts[1], 10);
+    if (!isNaN(p) && p > 0) port = p;
+  }
+  return { host: clean, port, ssl };
+}
+
 function doRouterRequest(
   config: { host: string; port: number; use_ssl: boolean; allow_insecure_cert: boolean; username: string; password?: string },
   endpoint: string,
   options: { method?: string; body?: any; timeoutMs?: number } = {}
 ): Promise<RouterHttpResponse> {
   return new Promise((resolve, reject) => {
-    const isHttps = Boolean(config.use_ssl);
+    const sanitized = sanitizeHost(config.host);
+    const targetHost = sanitized.host;
+    const targetPort = sanitized.port || config.port || (config.use_ssl ? 8443 : 80);
+    const isHttps = sanitized.ssl !== undefined ? sanitized.ssl : Boolean(config.use_ssl);
+
+    if (!targetHost) {
+      return reject(new Error('Router host address is missing'));
+    }
+
     const client = isHttps ? https : http;
     const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
     const restPath = cleanEndpoint.startsWith('/rest') ? cleanEndpoint : `/rest${cleanEndpoint}`;
@@ -83,8 +113,8 @@ function doRouterRequest(
     const bodyStr = options.body ? JSON.stringify(options.body) : null;
 
     const reqOptions: https.RequestOptions = {
-      hostname: config.host,
-      port: config.port,
+      hostname: targetHost,
+      port: targetPort,
       path: restPath,
       method: (options.method || 'GET').toUpperCase(),
       headers: {
@@ -94,7 +124,7 @@ function doRouterRequest(
         ...(bodyStr ? { 'Content-Length': Buffer.byteLength(bodyStr) } : {}),
       },
       agent: isHttps ? insecureHttpsAgent : defaultHttpAgent,
-      timeout: options.timeoutMs || 6000,
+      timeout: options.timeoutMs || 5000,
     };
 
     if (isHttps && config.allow_insecure_cert) {
@@ -125,7 +155,7 @@ function doRouterRequest(
 
     req.on('timeout', () => {
       req.destroy();
-      reject(new Error(`Connection timed out after ${options.timeoutMs || 6000}ms`));
+      reject(new Error(`Connection timed out after ${options.timeoutMs || 5000}ms to ${targetHost}:${targetPort}`));
     });
 
     req.on('error', (err) => {
@@ -850,42 +880,97 @@ class MikroTikService {
     }
   > = {};
 
+  private firewallLock: Promise<void> = Promise.resolve();
+
+  private async runWithFirewallLock<T>(fn: () => Promise<T>): Promise<T> {
+    const nextLock = this.firewallLock.then(async () => {
+      return await fn();
+    });
+    this.firewallLock = nextLock.then(
+      () => {},
+      () => {}
+    );
+    return nextLock;
+  }
+
+  private async addFirewallFilterRuleToRouter(body: Record<string, any>): Promise<any> {
+    try {
+      // Prioritize placing filter drop rules at index 0 so they precede default accept or fasttrack rules
+      return await this.makeRouterOsRequest('/ip/firewall/filter', {
+        method: 'PUT',
+        body: { ...body, 'place-before': '0' },
+      });
+    } catch {
+      // Fallback without place-before for RouterOS versions that reject place-before in REST
+      return await this.makeRouterOsRequest('/ip/firewall/filter', {
+        method: 'PUT',
+        body,
+      });
+    }
+  }
+
   private getPersistedFilePath(): string {
-    if (fs.existsSync('/data')) {
-      return '/data/clients_state.json';
-    }
-    const localDir = path.resolve(process.cwd(), 'data');
-    if (!fs.existsSync(localDir)) {
+    const candidatePaths = [
+      '/data/clients_state.json',
+      path.resolve(process.cwd(), 'data', 'clients_state.json'),
+    ];
+    for (const p of candidatePaths) {
       try {
-        fs.mkdirSync(localDir, { recursive: true });
-      } catch {}
+        const dir = path.dirname(p);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        const testFile = path.join(dir, '.write_test');
+        fs.writeFileSync(testFile, 'ok');
+        fs.unlinkSync(testFile);
+        return p;
+      } catch {
+        // continue to next
+      }
     }
-    return path.resolve(localDir, 'clients_state.json');
+    return path.resolve(process.cwd(), 'clients_state.json');
   }
 
   private loadPersistedState() {
     try {
-      const p = this.getPersistedFilePath();
-      if (fs.existsSync(p)) {
-        const content = fs.readFileSync(p, 'utf-8');
-        this.persistedClientsState = JSON.parse(content);
-        console.log(`[MikroTik Manager] Loaded persisted settings for ${Object.keys(this.persistedClientsState).length} client devices.`);
-        // Apply saved aliases/filters to existing initial clients
-        for (const client of this.clients) {
-          const saved = this.persistedClientsState[client.ip_address] || (client.mac_address ? this.persistedClientsState[client.mac_address] : null);
-          if (saved) {
-            if (saved.alias) client.alias = saved.alias;
-            if (saved.is_blocked !== undefined) {
-              client.is_blocked = saved.is_blocked;
-              client.status = saved.is_blocked ? 'blocked' : 'active';
-            }
-            if (saved.blocked_games) client.blocked_games = saved.blocked_games;
-            if (saved.blocked_websites) client.blocked_websites = saved.blocked_websites;
-            if (saved.custom_blocked_domains) client.custom_blocked_domains = saved.custom_blocked_domains;
-            if (saved.schedules) client.schedules = saved.schedules;
-            if (saved.max_download_limit) client.max_download_limit = saved.max_download_limit;
-            if (saved.max_upload_limit) client.max_upload_limit = saved.max_upload_limit;
+      const pathsToTry = [
+        '/data/clients_state.json',
+        path.resolve(process.cwd(), 'data', 'clients_state.json'),
+      ];
+      for (const p of pathsToTry) {
+        if (fs.existsSync(p)) {
+          try {
+            const content = fs.readFileSync(p, 'utf-8');
+            const parsed = JSON.parse(content);
+            this.persistedClientsState = { ...this.persistedClientsState, ...parsed };
+          } catch {}
+        }
+      }
+
+      console.log(
+        `[MikroTik Manager] Loaded persisted settings for ${
+          Object.keys(this.persistedClientsState).length
+        } client devices.`
+      );
+
+      // Apply saved aliases/filters to existing initial clients
+      for (const client of this.clients) {
+        const saved =
+          this.persistedClientsState[client.ip_address] ||
+          (client.mac_address ? this.persistedClientsState[client.mac_address] : null);
+        if (saved) {
+          if (saved.alias) client.alias = saved.alias;
+          if (saved.is_blocked !== undefined) {
+            client.is_blocked = saved.is_blocked;
+            client.status = saved.is_blocked ? 'blocked' : 'active';
           }
+          if (saved.blocked_games) client.blocked_games = saved.blocked_games;
+          if (saved.blocked_websites) client.blocked_websites = saved.blocked_websites;
+          if (saved.custom_blocked_domains)
+            client.custom_blocked_domains = saved.custom_blocked_domains;
+          if (saved.schedules) client.schedules = saved.schedules;
+          if (saved.max_download_limit) client.max_download_limit = saved.max_download_limit;
+          if (saved.max_upload_limit) client.max_upload_limit = saved.max_upload_limit;
         }
       }
     } catch (err) {
@@ -897,193 +982,47 @@ class MikroTikService {
     try {
       const p = this.getPersistedFilePath();
       fs.writeFileSync(p, JSON.stringify(this.persistedClientsState, null, 2), 'utf-8');
+      // Always maintain a mirror copy in local project data dir
+      try {
+        const localDir = path.resolve(process.cwd(), 'data');
+        if (!fs.existsSync(localDir)) fs.mkdirSync(localDir, { recursive: true });
+        fs.writeFileSync(
+          path.resolve(localDir, 'clients_state.json'),
+          JSON.stringify(this.persistedClientsState, null, 2),
+          'utf-8'
+        );
+      } catch {}
     } catch (err) {
       console.warn('[MikroTik Manager] Could not save persisted clients state:', err);
     }
   }
 
-  private async moveFilterRuleToTop(ruleId: string): Promise<void> {
-    if (!ruleId || !this.config.host) return;
-    try {
-      // 1. Try standard REST move with destination "0"
-      await this.makeRouterOsRequest('/ip/firewall/filter/move', {
-        method: 'POST',
-        body: {
-          '.id': ruleId,
-          destination: '0',
-        },
-      });
-      console.log(`[MikroTik RouterOS] Rule ${ruleId} moved to position 0.`);
-      return;
-    } catch (err1: any) {
-      // 2. Try destination targeting the first existing rule
-      try {
-        const filters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 }).catch(() => null);
-        if (Array.isArray(filters) && filters.length > 0) {
-          const firstId = filters[0]['.id'] || filters[0].id;
-          if (firstId && firstId !== ruleId) {
-            await this.makeRouterOsRequest('/ip/firewall/filter/move', {
-              method: 'POST',
-              body: {
-                '.id': ruleId,
-                destination: firstId,
-              },
-            });
-            console.log(`[MikroTik RouterOS] Rule ${ruleId} moved before first rule ${firstId}.`);
-            return;
-          }
-        }
-      } catch (err2: any) {}
-
-      // 3. Try with numbers parameter
-      try {
-        await this.makeRouterOsRequest('/ip/firewall/filter/move', {
-          method: 'POST',
-          body: {
-            numbers: ruleId,
-            destination: '0',
-          },
-        });
-        console.log(`[MikroTik RouterOS] Rule ${ruleId} moved to 0 using numbers.`);
-      } catch (err3: any) {
-        console.warn(`[MikroTik RouterOS] Note on rule ordering for ${ruleId}:`, err3.message || err1.message);
-      }
-    }
-  }
-
-  private async addFilterRuleAtTop(ruleBody: Record<string, any>): Promise<string | null> {
-    try {
-      const res = await this.makeRouterOsRequest('/ip/firewall/filter', {
-        method: 'PUT',
-        body: ruleBody,
-      });
-      let ruleId = res?.['.id'] || res?.ret || (typeof res === 'string' && res.startsWith('*') ? res : null);
-      if (!ruleId && ruleBody.comment) {
-        const all = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 }).catch(() => null);
-        if (Array.isArray(all)) {
-          const found = all.find((r: any) => r.comment === ruleBody.comment);
-          if (found) ruleId = found['.id'] || found.id;
-        }
-      }
-      if (ruleId) {
-        await this.moveFilterRuleToTop(ruleId);
-        return ruleId;
-      }
-    } catch (err: any) {
-      console.warn(`[MikroTik RouterOS] Error creating filter rule (${ruleBody.comment}):`, err.message);
-    }
-    return null;
-  }
-
-  private async flushClientConnections(clientIp: string): Promise<void> {
-    if (!clientIp || !this.config.host) return;
-    try {
-      console.log(`[MikroTik RouterOS] Checking active connections for ${clientIp} to flush...`);
-      const conns = await this.makeRouterOsRequest('/ip/firewall/connection', { timeoutMs: 3500 }).catch(() => null);
-      if (Array.isArray(conns) && conns.length > 0) {
-        const matches = conns.filter((c: any) => {
-          const src = c['src-address'] || '';
-          const dst = c['dst-address'] || '';
-          const replyDst = c['reply-dst-address'] || '';
-          const replySrc = c['reply-src-address'] || '';
-          return (
-            src.startsWith(`${clientIp}:`) ||
-            dst.startsWith(`${clientIp}:`) ||
-            replyDst.startsWith(`${clientIp}:`) ||
-            replySrc.startsWith(`${clientIp}:`)
-          );
-        });
-
-        if (matches.length > 0) {
-          console.log(`[MikroTik RouterOS] Terminating ${matches.length} active connection(s) for ${clientIp}`);
-          // 1. Try bulk remove
-          const idList = matches.map((c: any) => c['.id'] || c.id).filter(Boolean).slice(0, 40).join(',');
-          if (idList) {
-            await this.makeRouterOsRequest('/ip/firewall/connection/remove', {
-              method: 'POST',
-              body: { numbers: idList },
-            }).catch(() => null);
-          }
-
-          // 2. Individual DELETE fallback for remaining
-          for (const conn of matches.slice(0, 30)) {
-            const connId = conn['.id'] || conn.id;
-            if (connId) {
-              await this.makeRouterOsRequest(`/ip/firewall/connection/${connId}`, {
-                method: 'DELETE',
-              }).catch(() => null);
-            }
-          }
-        }
-      }
-    } catch (err: any) {
-      console.warn(`[MikroTik RouterOS] Note flushing connections for ${clientIp}:`, err.message);
-    }
-  }
-
   private async ensureBaseDropRule(): Promise<void> {
     try {
-      const filters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => null);
+      const filters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 });
       if (Array.isArray(filters)) {
-        // 1. Outbound forward drop (devices -> internet)
-        const hasOutbound = filters.find(
+        const hasRule = filters.some(
           (f: any) =>
             f.chain === 'forward' &&
             f.action === 'drop' &&
-            (f['src-address-list'] === 'ha_blocked_users' || f.src_address_list === 'ha_blocked_users')
+            (f['src-address-list'] === 'ha_blocked_users' ||
+              f.src_address_list === 'ha_blocked_users')
         );
-        if (!hasOutbound) {
-          console.log('[MikroTik RouterOS] Creating base outbound drop rule for ha_blocked_users at top...');
-          await this.addFilterRuleAtTop({
+        if (!hasRule) {
+          console.log('[MikroTik RouterOS] Creating base forward drop rule for ha_blocked_users...');
+          await this.addFirewallFilterRuleToRouter({
             chain: 'forward',
             action: 'drop',
             'src-address-list': 'ha_blocked_users',
-            comment: 'HA Drop Blocked Users Outbound',
+            comment: 'HA Drop Blocked Devices',
           });
-        } else {
-          await this.moveFilterRuleToTop(hasOutbound['.id'] || hasOutbound.id);
-        }
-
-        // 2. Inbound forward drop (internet -> devices)
-        const hasInbound = filters.find(
-          (f: any) =>
-            f.chain === 'forward' &&
-            f.action === 'drop' &&
-            (f['dst-address-list'] === 'ha_blocked_users' || f.dst_address_list === 'ha_blocked_users')
-        );
-        if (!hasInbound) {
-          console.log('[MikroTik RouterOS] Creating base inbound drop rule for ha_blocked_users at top...');
-          await this.addFilterRuleAtTop({
-            chain: 'forward',
-            action: 'drop',
-            'dst-address-list': 'ha_blocked_users',
-            comment: 'HA Drop Blocked Users Inbound',
-          });
-        } else {
-          await this.moveFilterRuleToTop(hasInbound['.id'] || hasInbound.id);
-        }
-
-        // 3. Local router services input drop (stops blocked devices querying DNS or accessing router)
-        const hasInput = filters.find(
-          (f: any) =>
-            f.chain === 'input' &&
-            f.action === 'drop' &&
-            (f['src-address-list'] === 'ha_blocked_users' || f.src_address_list === 'ha_blocked_users')
-        );
-        if (!hasInput) {
-          console.log('[MikroTik RouterOS] Creating base input drop rule for ha_blocked_users at top...');
-          await this.addFilterRuleAtTop({
-            chain: 'input',
-            action: 'drop',
-            'src-address-list': 'ha_blocked_users',
-            comment: 'HA Drop Blocked Users Local/DNS Services',
-          });
-        } else {
-          await this.moveFilterRuleToTop(hasInput['.id'] || hasInput.id);
         }
       }
     } catch (err: any) {
-      console.warn('[MikroTik RouterOS] Could not verify/create base drop rules for ha_blocked_users:', err.message);
+      console.warn(
+        '[MikroTik RouterOS] Could not verify/create base drop rule for ha_blocked_users:',
+        err.message
+      );
     }
   }
 
@@ -1139,161 +1078,178 @@ class MikroTikService {
       this.syncRealRouter().catch(() => {});
     }
 
-    if (!this.config.connected || this.config.mode === 'demo') {
-      // Fluctuate CPU slightly
+    // Fluctuate CPU slightly if not provided by router
+    if (!this.config.connected) {
       this.routerInfo.cpu_load_percent = Math.min(
         95,
         Math.max(8, Math.round(this.routerInfo.cpu_load_percent + (Math.random() * 6 - 3)))
       );
       this.routerInfo.uptime_seconds += 1;
+    }
 
-      // Check panic killswitch
-      if (this.panicKillswitchActive) {
-        const wan = this.interfaces.find((i) => i.is_wan);
-        if (wan) {
-          wan.rx_bps = 8000;
-          wan.tx_bps = 2000;
-        }
-        this.throughputHistory.push({
-          timestamp: now,
-          time_label,
-          wan_rx_mbps: 0.01,
-          wan_tx_mbps: 0.01,
-          lan_rx_mbps: 0.05,
-          lan_tx_mbps: 0.05,
-        });
-        if (this.throughputHistory.length > 60) this.throughputHistory.shift();
-        return;
-      }
-
-      let currentWanRx = 0;
-      let currentWanTx = 0;
-
-      for (const client of this.clients) {
-        if (client.is_blocked) {
-          client.rx_rate_bps = 0;
-          client.tx_rate_bps = 0;
-          client.status = 'blocked';
-          continue;
-        }
-
-        // Multi-Restriction Time Slots Evaluation
-        let activeRestrictionAction: RestrictionTimeSlot['action'] | null = null;
-        let activeThrottleSpeed = '1M/512k';
-
-        if (client.schedules && client.schedules.length > 0) {
-          for (const slot of client.schedules) {
-            if (!slot.enabled) continue;
-            if (!slot.days.includes(currentDay)) continue;
-
-            if (this.isTimeInWindow(slot.start_time, slot.end_time, curTimeStr)) {
-              activeRestrictionAction = slot.action;
-              if (slot.throttle_speed) {
-                activeThrottleSpeed = slot.throttle_speed;
-              }
-              break; // Highest matching restriction takes precedence
-            }
-          }
-        }
-
-        // If time restriction action is block_all:
-        if (activeRestrictionAction === 'block_all') {
-          client.rx_rate_bps = 0;
-          client.tx_rate_bps = 0;
-          client.status = 'blocked';
-          continue;
-        }
-
-        // Base speed ceiling from Simple Queue
-        let maxDownBps = 100_000_000;
-        if (client.max_download_limit && client.max_download_limit.endsWith('M')) {
-          maxDownBps = parseFloat(client.max_download_limit) * 1_000_000;
-        }
-
-        // If time restriction action is throttle:
-        if (activeRestrictionAction === 'throttle') {
-          maxDownBps = Math.min(maxDownBps, 1_000_000); // Throttle down to 1 Mbps
-        }
-
-        // Fluctuate based on device category & filters
-        let rxFactor = 1.0;
-        if (activeRestrictionAction === 'block_games' || (client.blocked_games && client.blocked_games.length > 0)) {
-          // Drops gaming bursts (typically 40-70% reduction in high interactive traffic)
-          rxFactor *= 0.45;
-        }
-        if (activeRestrictionAction === 'block_websites' || (client.blocked_websites && client.blocked_websites.length > 0)) {
-          // Drops video CDN & social media feeds
-          rxFactor *= 0.55;
-        }
-
-        if (client.hostname.includes('MacBook')) {
-          client.rx_rate_bps = Math.min(
-            maxDownBps,
-            Math.max(1_200_000, client.rx_rate_bps + (Math.random() * 4_000_000 - 2_000_000)) * rxFactor
-          );
-          client.tx_rate_bps = Math.max(200_000, client.tx_rate_bps + (Math.random() * 800_000 - 400_000));
-        } else if (client.hostname.includes('iPad')) {
-          client.rx_rate_bps = Math.min(
-            maxDownBps,
-            Math.max(800_000, client.rx_rate_bps + (Math.random() * 2_000_000 - 1_000_000)) * rxFactor
-          );
-          client.tx_rate_bps = Math.max(100_000, client.tx_rate_bps + (Math.random() * 200_000 - 100_000));
-        } else if (client.hostname.includes('PlayStation')) {
-          client.rx_rate_bps = Math.min(
-            maxDownBps,
-            Math.max(2_000_000, client.rx_rate_bps + (Math.random() * 6_000_000 - 3_000_000)) * rxFactor
-          );
-          client.tx_rate_bps = Math.max(500_000, client.tx_rate_bps + (Math.random() * 1_000_000 - 500_000));
-        } else if (client.hostname.includes('OLED')) {
-          client.rx_rate_bps = Math.min(
-            maxDownBps,
-            Math.max(6_000_000, client.rx_rate_bps + (Math.random() * 2_000_000 - 1_000_000))
-          );
-        }
-
-        client.total_download_bytes += Math.round(client.rx_rate_bps / 8);
-        client.total_upload_bytes += Math.round(client.tx_rate_bps / 8);
-
-        currentWanRx += client.rx_rate_bps;
-        currentWanTx += client.tx_rate_bps;
-      }
-
-      currentWanRx += 2_500_000;
-      currentWanTx += 1_200_000;
-
+    // Check panic killswitch
+    if (this.panicKillswitchActive) {
       const wan = this.interfaces.find((i) => i.is_wan);
       if (wan) {
-        wan.rx_bps = Math.round(currentWanRx);
-        wan.tx_bps = Math.round(currentWanTx);
-        wan.total_rx_bytes += Math.round(currentWanRx / 8);
-        wan.total_tx_bytes += Math.round(currentWanTx / 8);
+        wan.rx_bps = 8000;
+        wan.tx_bps = 2000;
       }
-
-      for (const queue of this.queues) {
-        const client = this.clients.find((c) => queue.target.includes(c.ip_address));
-        if (client) {
-          queue.current_rate_download_bps = client.rx_rate_bps;
-          queue.current_rate_upload_bps = client.tx_rate_bps;
-          queue.total_bytes_download += Math.round(client.rx_rate_bps / 8);
-          queue.total_bytes_upload += Math.round(client.tx_rate_bps / 8);
-        }
+      for (const client of this.clients) {
+        client.rx_rate_bps = 0;
+        client.tx_rate_bps = 0;
       }
-
-      const wanRxMbps = Number((currentWanRx / 1_000_000).toFixed(2));
-      const wanTxMbps = Number((currentWanTx / 1_000_000).toFixed(2));
-
       this.throughputHistory.push({
         timestamp: now,
         time_label,
-        wan_rx_mbps: wanRxMbps,
-        wan_tx_mbps: wanTxMbps,
-        lan_rx_mbps: Number((wanTxMbps * 0.96).toFixed(2)),
-        lan_tx_mbps: Number((wanRxMbps * 0.98).toFixed(2)),
+        wan_rx_mbps: 0.01,
+        wan_tx_mbps: 0.01,
+        lan_rx_mbps: 0.05,
+        lan_tx_mbps: 0.05,
       });
+      if (this.throughputHistory.length > 60) this.throughputHistory.shift();
+      return;
+    }
 
-      if (this.throughputHistory.length > 60) {
-        this.throughputHistory.shift();
+    let calculatedWanRx = 0;
+    let calculatedWanTx = 0;
+
+    // Live update bandwidth, QoS queues, and restrictions for all clients
+    for (const client of this.clients) {
+      if (client.is_blocked) {
+        client.rx_rate_bps = 0;
+        client.tx_rate_bps = 0;
+        client.status = 'blocked';
+        continue;
       }
+
+      // Multi-Restriction Time Slots Evaluation
+      let activeRestrictionAction: RestrictionTimeSlot['action'] | null = null;
+      let activeThrottleSpeed = '1M/512k';
+
+      if (client.schedules && client.schedules.length > 0) {
+        for (const slot of client.schedules) {
+          if (!slot.enabled) continue;
+          if (!slot.days.includes(currentDay)) continue;
+
+          if (this.isTimeInWindow(slot.start_time, slot.end_time, curTimeStr)) {
+            activeRestrictionAction = slot.action;
+            if (slot.throttle_speed) {
+              activeThrottleSpeed = slot.throttle_speed;
+            }
+            break;
+          }
+        }
+      }
+
+      // If time restriction action is block_all:
+      if (activeRestrictionAction === 'block_all') {
+        client.rx_rate_bps = 0;
+        client.tx_rate_bps = 0;
+        client.status = 'blocked';
+        continue;
+      }
+
+      // Speed ceiling from Simple Queue
+      let maxDownBps = 100_000_000;
+      if (client.max_download_limit && client.max_download_limit.endsWith('M')) {
+        maxDownBps = parseFloat(client.max_download_limit) * 1_000_000;
+      }
+
+      if (activeRestrictionAction === 'throttle') {
+        maxDownBps = Math.min(maxDownBps, 1_000_000);
+      }
+
+      let rxFactor = 1.0;
+      if (activeRestrictionAction === 'block_games' || (client.blocked_games && client.blocked_games.length > 0)) {
+        rxFactor *= 0.45;
+      }
+      if (activeRestrictionAction === 'block_websites' || (client.blocked_websites && client.blocked_websites.length > 0)) {
+        rxFactor *= 0.55;
+      }
+
+      // Check if there is a matching Simple Queue with real router rate
+      const matchingQueue = this.queues.find((q) => q.target.includes(client.ip_address));
+      if (matchingQueue && matchingQueue.current_rate_download_bps > 0) {
+        client.rx_rate_bps = matchingQueue.current_rate_download_bps;
+        client.tx_rate_bps = matchingQueue.current_rate_upload_bps;
+      } else {
+        // Dynamic live bandwidth pulsation
+        const hostLower = (client.hostname + ' ' + client.alias).toLowerCase();
+        let baseRx = 900_000;
+        let baseTx = 150_000;
+
+        if (hostLower.includes('macbook') || hostLower.includes('pc') || hostLower.includes('laptop')) {
+          baseRx = 3_200_000;
+          baseTx = 600_000;
+        } else if (hostLower.includes('oled') || hostLower.includes('tv') || hostLower.includes('soundbar')) {
+          baseRx = 6_500_000;
+          baseTx = 80_000;
+        } else if (hostLower.includes('playstation') || hostLower.includes('xbox') || hostLower.includes('switch')) {
+          baseRx = 4_800_000;
+          baseTx = 750_000;
+        } else if (hostLower.includes('ipad') || hostLower.includes('phone') || hostLower.includes('iphone')) {
+          baseRx = 1_800_000;
+          baseTx = 220_000;
+        }
+
+        const deltaRx = (Math.random() * 2_000_000 - 1_000_000);
+        const deltaTx = (Math.random() * 400_000 - 200_000);
+        const currentRx = Math.min(maxDownBps, Math.max(80_000, (client.rx_rate_bps || baseRx) * 0.7 + (baseRx + deltaRx) * 0.3) * rxFactor);
+        const currentTx = Math.max(30_000, (client.tx_rate_bps || baseTx) * 0.7 + (baseTx + deltaTx) * 0.3);
+
+        client.rx_rate_bps = Math.round(currentRx);
+        client.tx_rate_bps = Math.round(currentTx);
+      }
+
+      client.status = client.rx_rate_bps > 50_000 ? 'active' : 'idle';
+      client.total_download_bytes += Math.round(client.rx_rate_bps / 8);
+      client.total_upload_bytes += Math.round(client.tx_rate_bps / 8);
+
+      calculatedWanRx += client.rx_rate_bps;
+      calculatedWanTx += client.tx_rate_bps;
+    }
+
+    calculatedWanRx += 1_200_000; // Network infrastructure overhead
+    calculatedWanTx += 400_000;
+
+    // Update Simple Queues
+    for (const queue of this.queues) {
+      const client = this.clients.find((c) => queue.target.includes(c.ip_address));
+      if (client) {
+        queue.current_rate_download_bps = client.rx_rate_bps;
+        queue.current_rate_upload_bps = client.tx_rate_bps;
+        queue.total_bytes_download += Math.round(client.rx_rate_bps / 8);
+        queue.total_bytes_upload += Math.round(client.tx_rate_bps / 8);
+      }
+    }
+
+    const wan = this.interfaces.find((i) => i.is_wan);
+    if (wan) {
+      if (!this.config.connected || wan.rx_bps === 0) {
+        wan.rx_bps = Math.round(calculatedWanRx);
+        wan.tx_bps = Math.round(calculatedWanTx);
+        wan.total_rx_bytes += Math.round(calculatedWanRx / 8);
+        wan.total_tx_bytes += Math.round(calculatedWanTx / 8);
+      }
+    }
+
+    const finalWanRx = wan ? wan.rx_bps : calculatedWanRx;
+    const finalWanTx = wan ? wan.tx_bps : calculatedWanTx;
+
+    const wanRxMbps = Number((finalWanRx / 1_000_000).toFixed(2));
+    const wanTxMbps = Number((finalWanTx / 1_000_000).toFixed(2));
+
+    this.throughputHistory.push({
+      timestamp: now,
+      time_label,
+      wan_rx_mbps: wanRxMbps,
+      wan_tx_mbps: wanTxMbps,
+      lan_rx_mbps: Number((wanTxMbps * 0.96).toFixed(2)),
+      lan_tx_mbps: Number((wanRxMbps * 0.98).toFixed(2)),
+    });
+
+    if (this.throughputHistory.length > 60) {
+      this.throughputHistory.shift();
     }
   }
 
@@ -1397,16 +1353,17 @@ class MikroTikService {
         // continue
       }
 
-      // Sync other tables every 3 polls (6 seconds) to avoid stressing router CPU
+      // Sync other tables every 3 polls (3 seconds) to ensure real-time consistency
       this.syncCount++;
       if (this.syncCount % 3 === 0) {
         try {
-          const [leases, addrLists, qs, fw, sch] = await Promise.all([
+          const [leases, addrLists, qs, fw, sch, arpEntries] = await Promise.all([
             this.makeRouterOsRequest('/ip/dhcp-server/lease', { timeoutMs: 3500 }).catch(() => null),
             this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3500 }).catch(() => null),
             this.makeRouterOsRequest('/queue/simple', { timeoutMs: 3500 }).catch(() => null),
             this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => null),
             this.makeRouterOsRequest('/system/scheduler', { timeoutMs: 3500 }).catch(() => null),
+            this.makeRouterOsRequest('/ip/arp', { timeoutMs: 3500 }).catch(() => null),
           ]);
 
           if (Array.isArray(addrLists)) {
@@ -1427,37 +1384,165 @@ class MikroTikService {
               .map((a) => a.address)
           );
 
-          if (Array.isArray(leases) && leases.length > 0) {
-            this.clients = leases.map((l: any, idx: number) => {
+          // Build a unified device map combining DHCP leases and active ARP table
+          const discoveredMap = new Map<string, any>();
+
+          if (Array.isArray(leases)) {
+            for (const l of leases) {
               const ip = l['active-address'] || l.address;
-              const mac = l['active-mac-address'] || l['mac-address'] || '';
-              const host = l['active-host-name'] || l['host-name'] || l.comment || `Client-${ip?.split('.').slice(-1)[0]}`;
+              if (ip) {
+                discoveredMap.set(ip, {
+                  ip,
+                  mac: l['active-mac-address'] || l['mac-address'] || '',
+                  host: l['active-host-name'] || l['host-name'] || l.comment || '',
+                  interface: l.server || 'bridge',
+                  status: l.status || 'bound',
+                  lastSeen: l['last-seen'] || 'Active',
+                });
+              }
+            }
+          }
+
+          if (Array.isArray(arpEntries)) {
+            for (const a of arpEntries) {
+              const ip = a.address;
+              if (ip && !discoveredMap.has(ip) && !ip.endsWith('.255') && !ip.startsWith('127.')) {
+                discoveredMap.set(ip, {
+                  ip,
+                  mac: a['mac-address'] || '',
+                  host: a.comment || `Device-${ip.split('.').slice(-1)[0]}`,
+                  interface: a.interface || 'bridge',
+                  status: a.complete === 'true' || a.complete === true ? 'bound' : 'waiting',
+                  lastSeen: 'Active (ARP)',
+                });
+              }
+            }
+          }
+
+          // Detect game and website shield rules directly from RouterOS active firewall filter
+          const routerDetectedBlockedGamesByIp = new Map<string, Set<string>>();
+          const routerDetectedBlockedWebsByIp = new Map<string, Set<string>>();
+          const routerDetectedCustomDomainsByIp = new Map<string, Set<string>>();
+
+          if (Array.isArray(fw)) {
+            for (const r of fw) {
+              const comment = String(r.comment || '');
+              const ipMatch = comment.match(/(?:Game Shield|Web Shield|HA Game|HA Web)\s*\[([0-9.]+)\]/i);
+              if (ipMatch) {
+                const ip = ipMatch[1];
+                if (comment.includes('Game Shield') || comment.includes('HA Game')) {
+                  for (const g of POPULAR_GAMES) {
+                    if (
+                      comment.toLowerCase().includes(g.name.toLowerCase()) ||
+                      comment.toLowerCase().includes(g.id.toLowerCase())
+                    ) {
+                      if (!routerDetectedBlockedGamesByIp.has(ip)) {
+                        routerDetectedBlockedGamesByIp.set(ip, new Set());
+                      }
+                      routerDetectedBlockedGamesByIp.get(ip)!.add(g.id);
+                    }
+                  }
+                }
+                if (comment.includes('Web Shield') || comment.includes('HA Web')) {
+                  for (const w of POPULAR_WEBSITES) {
+                    if (
+                      comment.toLowerCase().includes(w.name.toLowerCase()) ||
+                      comment.toLowerCase().includes(w.id.toLowerCase())
+                    ) {
+                      if (!routerDetectedBlockedWebsByIp.has(ip)) {
+                        routerDetectedBlockedWebsByIp.set(ip, new Set());
+                      }
+                      routerDetectedBlockedWebsByIp.get(ip)!.add(w.id);
+                    }
+                  }
+                  const customMatch = comment.match(/Custom\s+([^\s)]+)/i);
+                  if (customMatch) {
+                    if (!routerDetectedCustomDomainsByIp.has(ip)) {
+                      routerDetectedCustomDomainsByIp.set(ip, new Set());
+                    }
+                    routerDetectedCustomDomainsByIp.get(ip)!.add(customMatch[1].trim());
+                  }
+                }
+              }
+            }
+          }
+
+          if (discoveredMap.size > 0) {
+            const rawClientsList = Array.from(discoveredMap.values());
+            this.clients = rawClientsList.map((d: any, idx: number) => {
+              const ip = d.ip;
+              const mac = d.mac;
+              const host = d.host || `Client-${ip.split('.').slice(-1)[0]}`;
               const isBlockedOnRouter = blockedIps.has(ip);
 
-              // Merge persisted settings
+              const prev = this.clients.find((c) => c.ip_address === ip || (mac && c.mac_address === mac));
+              const queueMatch = Array.isArray(qs) ? qs.find((q: any) => q.target?.includes(ip)) : null;
+
+              let rxBps = prev ? prev.rx_rate_bps : 750000;
+              let txBps = prev ? prev.tx_rate_bps : 180000;
+              let downBytes = prev ? prev.total_download_bytes : 1024 * 1024 * 50;
+              let upBytes = prev ? prev.total_upload_bytes : 1024 * 1024 * 10;
+
+              if (queueMatch) {
+                const rates = (queueMatch.rate || '').split('/');
+                if (rates.length === 2) {
+                  txBps = Number(rates[0]) || txBps;
+                  rxBps = Number(rates[1]) || rxBps;
+                }
+                const bytes = (queueMatch.bytes || '').split('/');
+                if (bytes.length === 2) {
+                  upBytes = Number(bytes[0]) || upBytes;
+                  downBytes = Number(bytes[1]) || downBytes;
+                }
+              }
+
+              // Merge persisted settings and real rules discovered from router
               const saved = this.persistedClientsState[ip] || (mac ? this.persistedClientsState[mac] : null) || {};
               const isBlocked = isBlockedOnRouter || Boolean(saved.is_blocked);
-              const blockedGames = saved.blocked_games || [];
-              const blockedWebsites = saved.blocked_websites || [];
-              const customDomains = saved.custom_blocked_domains || [];
+              const routerGames = Array.from(routerDetectedBlockedGamesByIp.get(ip) || []);
+              const routerWebs = Array.from(routerDetectedBlockedWebsByIp.get(ip) || []);
+              const routerCustoms = Array.from(routerDetectedCustomDomainsByIp.get(ip) || []);
+
+              const blockedGames = Array.from(new Set([...(saved.blocked_games || []), ...routerGames]));
+              const blockedWebsites = Array.from(new Set([...(saved.blocked_websites || []), ...routerWebs]));
+              const customDomains = Array.from(new Set([...(saved.custom_blocked_domains || []), ...routerCustoms]));
               const schedules = saved.schedules || [];
-              const alias = saved.alias || l.comment || host;
+              const alias = saved.alias || d.comment || host;
+
+              // Keep local persistence updated with router reality
+              if (!this.persistedClientsState[ip]) {
+                this.persistedClientsState[ip] = {};
+              }
+              if (blockedGames.length > 0 && !saved.blocked_games) {
+                this.persistedClientsState[ip].blocked_games = blockedGames;
+              }
+              if (blockedWebsites.length > 0 && !saved.blocked_websites) {
+                this.persistedClientsState[ip].blocked_websites = blockedWebsites;
+              }
+              if (customDomains.length > 0 && !saved.custom_blocked_domains) {
+                this.persistedClientsState[ip].custom_blocked_domains = customDomains;
+              }
+
+              if (isBlocked) {
+                rxBps = 0;
+                txBps = 0;
+              }
 
               return {
-                id: l['.id'] || `c-${idx}`,
+                id: `c-${idx}`,
                 hostname: host,
                 alias,
                 ip_address: ip,
                 mac_address: mac,
                 vendor: 'Network Client',
-                interface: l['server'] || 'bridge',
+                interface: d.interface,
                 connection_type: 'ethernet',
-                status: isBlocked ? 'blocked' : (l.status === 'bound' ? 'active' : 'idle'),
-                rx_rate_bps: isBlocked ? 0 : 500000,
-                tx_rate_bps: isBlocked ? 0 : 120000,
-                total_download_bytes: 1024 * 1024 * 50,
-                total_upload_bytes: 1024 * 1024 * 10,
-                uptime: l['last-seen'] || 'Active',
+                status: isBlocked ? 'blocked' : (d.status === 'bound' ? 'active' : 'idle'),
+                rx_rate_bps: rxBps,
+                tx_rate_bps: txBps,
+                total_download_bytes: downBytes,
+                total_upload_bytes: upBytes,
+                uptime: d.lastSeen,
                 last_seen: 'Just now',
                 is_blocked: isBlocked,
                 block_method: 'firewall_address_list',
@@ -1467,24 +1552,9 @@ class MikroTikService {
                 blocked_games: blockedGames,
                 blocked_websites: blockedWebsites,
                 custom_blocked_domains: customDomains,
-                dhcp_status: l.status || 'bound',
+                dhcp_status: d.status,
               };
             });
-
-            // On initial sync, ensure all saved blocks and filter rules are actively placed at top of router firewall
-            if (this.syncCount === 3) {
-              this.ensureBaseDropRule().catch(() => null);
-              for (const c of this.clients) {
-                if (
-                  c.is_blocked ||
-                  (c.blocked_games && c.blocked_games.length > 0) ||
-                  (c.blocked_websites && c.blocked_websites.length > 0) ||
-                  (c.custom_blocked_domains && c.custom_blocked_domains.length > 0)
-                ) {
-                  this.syncClientFirewallRules(c).catch(() => null);
-                }
-              }
-            }
           }
 
           if (Array.isArray(qs)) {
@@ -1616,6 +1686,72 @@ class MikroTikService {
     return false;
   }
 
+  private async tryRouterOsCliFallback(endpoint: string, method: string, body?: any): Promise<any> {
+    try {
+      const clean = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+      const authConfig = {
+        host: this.config.host,
+        port: this.config.port || (this.config.use_ssl ? 8443 : 80),
+        username: this.config.username || 'admin',
+        password: this.config.password || '',
+        use_ssl: Boolean(this.config.use_ssl),
+        allow_insecure_cert: this.config.allow_insecure_cert ?? true,
+      };
+
+      if (method === 'PUT') {
+        const addEndpoint = `${clean}/add`;
+        const res = await doRouterRequest(authConfig, addEndpoint, {
+          method: 'POST',
+          body,
+          timeoutMs: 4000,
+        });
+        if (res.status >= 200 && res.status < 300) {
+          console.log(`[MikroTik CLI Fallback] Success on POST ${addEndpoint}`);
+          return res.data;
+        }
+      }
+
+      if (method === 'DELETE') {
+        const lastSlash = clean.lastIndexOf('/');
+        if (lastSlash > 0) {
+          const parent = clean.substring(0, lastSlash);
+          const itemId = clean.substring(lastSlash + 1);
+          const removeEndpoint = `${parent}/remove`;
+          const res = await doRouterRequest(authConfig, removeEndpoint, {
+            method: 'POST',
+            body: { '.id': itemId, numbers: itemId },
+            timeoutMs: 4000,
+          });
+          if (res.status >= 200 && res.status < 300) {
+            console.log(`[MikroTik CLI Fallback] Success on POST ${removeEndpoint} for ${itemId}`);
+            return res.data;
+          }
+        }
+      }
+
+      if (method === 'PATCH') {
+        const lastSlash = clean.lastIndexOf('/');
+        if (lastSlash > 0) {
+          const parent = clean.substring(0, lastSlash);
+          const itemId = clean.substring(lastSlash + 1);
+          const setEndpoint = `${parent}/set`;
+          const res = await doRouterRequest(authConfig, setEndpoint, {
+            method: 'POST',
+            body: { '.id': itemId, numbers: itemId, ...(body || {}) },
+            timeoutMs: 4000,
+          });
+          if (res.status >= 200 && res.status < 300) {
+            console.log(`[MikroTik CLI Fallback] Success on POST ${setEndpoint} for ${itemId}`);
+            return res.data;
+          }
+        }
+      }
+    } catch (e: any) {
+      console.warn(`[MikroTik CLI Fallback] Fallback execution failed: ${e.message}`);
+    }
+    return null;
+  }
+
   // --- Real RouterOS REST API communication (RouterOS v7) ---
   private async makeRouterOsRequest(
     endpoint: string,
@@ -1625,25 +1761,54 @@ class MikroTikService {
       throw new Error('Router host IP is not configured');
     }
 
-    const res = await doRouterRequest(
-      {
-        host: this.config.host,
-        port: this.config.port || (this.config.use_ssl ? 8443 : 80),
-        username: this.config.username || 'admin',
-        password: this.config.password || '',
-        use_ssl: this.config.use_ssl ?? true,
-        allow_insecure_cert: this.config.allow_insecure_cert ?? true,
-      },
-      endpoint,
-      options
-    );
+    const method = (options.method || 'GET').toUpperCase();
 
-    if (res.status >= 400) {
+    try {
+      const res = await doRouterRequest(
+        {
+          host: this.config.host,
+          port: this.config.port || (this.config.use_ssl ? 8443 : 80),
+          username: this.config.username || 'admin',
+          password: this.config.password || '',
+          use_ssl: this.config.use_ssl ?? true,
+          allow_insecure_cert: this.config.allow_insecure_cert ?? true,
+        },
+        endpoint,
+        options
+      );
+
+      if (res.status >= 200 && res.status < 300) {
+        this.config.connected = true;
+        this.config.last_error = undefined;
+        this.config.last_sync = new Date().toISOString();
+        return res.data;
+      }
+
+      // If standard REST failed, attempt RouterOS CLI console fallback
+      if (res.status === 404 || res.status === 405 || res.status === 400) {
+        const fallback = await this.tryRouterOsCliFallback(endpoint, method, options.body);
+        if (fallback !== null) {
+          this.config.connected = true;
+          this.config.last_error = undefined;
+          this.config.last_sync = new Date().toISOString();
+          return fallback;
+        }
+      }
+
       const errDetail = typeof res.data === 'object' ? JSON.stringify(res.data) : res.raw || res.statusText;
       throw new Error(`RouterOS HTTP ${res.status}: ${errDetail}`);
+    } catch (err: any) {
+      if (method === 'PUT' || method === 'DELETE' || method === 'PATCH') {
+        const fallback = await this.tryRouterOsCliFallback(endpoint, method, options.body).catch(() => null);
+        if (fallback !== null) {
+          this.config.connected = true;
+          this.config.last_error = undefined;
+          this.config.last_sync = new Date().toISOString();
+          return fallback;
+        }
+      }
+      throw err;
     }
-
-    return res.data;
   }
 
   // --- Public API Methods ---
@@ -1879,39 +2044,60 @@ class MikroTikService {
     return this.clients;
   }
 
-  public async blockClient(ipOrMac: string, block: boolean) {
+  public ensureClientExists(ipOrMac: string): ClientDevice {
+    const clean = ipOrMac.trim();
     let client = this.clients.find(
-      (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
+      (c) =>
+        c.ip_address === clean ||
+        (c.mac_address && c.mac_address.toLowerCase() === clean.toLowerCase())
     );
     if (!client) {
+      const isIp = clean.includes('.');
+      const isMac = clean.includes(':');
+      const ip = isIp ? clean : '';
+      const mac = isMac ? clean : '';
+      const defaultHost = ip ? `Device-${ip.split('.').slice(-1)[0]}` : `Device-${clean.slice(-4)}`;
+
+      // Check if we have saved state for this device
+      const saved =
+        this.persistedClientsState[clean] ||
+        (ip ? this.persistedClientsState[ip] : null) ||
+        (mac ? this.persistedClientsState[mac] : null) ||
+        {};
+
       client = {
-        id: `c-${Date.now()}`,
-        hostname: `Client-${ipOrMac}`,
-        alias: `Client-${ipOrMac}`,
-        ip_address: ipOrMac,
-        mac_address: '',
+        id: `c-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        hostname: defaultHost,
+        alias: saved.alias || defaultHost,
+        ip_address: ip || clean,
+        mac_address: mac,
         vendor: 'Network Device',
         interface: 'bridge',
         connection_type: 'ethernet',
-        status: block ? 'blocked' : 'active',
+        status: saved.is_blocked ? 'blocked' : 'active',
         rx_rate_bps: 0,
         tx_rate_bps: 0,
         total_download_bytes: 0,
         total_upload_bytes: 0,
         uptime: 'Active',
         last_seen: 'Just now',
-        is_blocked: block,
+        is_blocked: Boolean(saved.is_blocked),
         block_method: 'firewall_address_list',
-        max_download_limit: block ? 'Blocked' : 'Uncapped',
-        max_upload_limit: block ? 'Blocked' : 'Uncapped',
-        schedules: [],
-        blocked_games: [],
-        blocked_websites: [],
-        custom_blocked_domains: [],
+        max_download_limit: saved.max_download_limit || 'Uncapped',
+        max_upload_limit: saved.max_upload_limit || 'Uncapped',
+        schedules: saved.schedules || [],
+        blocked_games: saved.blocked_games || [],
+        blocked_websites: saved.blocked_websites || [],
+        custom_blocked_domains: saved.custom_blocked_domains || [],
         dhcp_status: 'bound',
       };
       this.clients.push(client);
     }
+    return client;
+  }
+
+  public async blockClient(ipOrMac: string, block: boolean) {
+    const client = this.ensureClientExists(ipOrMac);
 
     client.is_blocked = block;
     client.status = block ? 'blocked' : 'active';
@@ -1929,7 +2115,7 @@ class MikroTikService {
 
     // Update in-memory address list
     const existingIndex = this.addressLists.findIndex(
-      (a) => a.list === 'ha_blocked_users' && a.address === client!.ip_address
+      (a) => a.list === 'ha_blocked_users' && a.address === client.ip_address
     );
     if (block) {
       if (existingIndex === -1) {
@@ -1953,21 +2139,58 @@ class MikroTikService {
 
     // Send real commands to RouterOS REST API
     if (this.config.host && client.ip_address) {
-      await this.syncClientFirewallRules(client).catch((err) => {
-        console.error(`[MikroTik RouterOS] Error syncing block rules for ${client.ip_address}:`, err.message);
-      });
+      try {
+        if (block) {
+          // 1. Ensure forward drop rule exists in /ip/firewall/filter
+          await this.ensureBaseDropRule();
+
+          // 2. Query address lists to see if already present
+          const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 });
+          const alreadyInList =
+            Array.isArray(addrLists) &&
+            addrLists.some(
+              (a: any) => a.list === 'ha_blocked_users' && a.address === client.ip_address
+            );
+
+          if (!alreadyInList) {
+            console.log(`[MikroTik RouterOS] Adding ${client.ip_address} to ha_blocked_users address list...`);
+            await this.makeRouterOsRequest('/ip/firewall/address-list', {
+              method: 'PUT',
+              body: {
+                list: 'ha_blocked_users',
+                address: client.ip_address,
+                comment: `Blocked via Home Assistant: ${client.alias || client.hostname}`,
+              },
+            });
+          }
+        } else {
+          // Unblock: find entry on RouterOS and delete it
+          const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 });
+          if (Array.isArray(addrLists)) {
+            const matches = addrLists.filter(
+              (a: any) => a.list === 'ha_blocked_users' && a.address === client.ip_address
+            );
+            for (const m of matches) {
+              const ruleId = m['.id'] || m.id;
+              if (ruleId) {
+                console.log(`[MikroTik RouterOS] Removing ${client.ip_address} (ID ${ruleId}) from ha_blocked_users...`);
+                await this.makeRouterOsRequest(`/ip/firewall/address-list/${ruleId}`, {
+                  method: 'DELETE',
+                });
+              }
+            }
+          }
+        }
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Failed to update router address list for ${client.ip_address}:`, err.message);
+      }
     }
 
     return client;
   }
 
   public async setClientSpeedLimit(ipOrMac: string, maxDownload: string, maxUpload: string) {
-    let client = this.clients.find(
-      (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
-    );
-    if (!client) {
-      throw new Error(`Device not found: ${ipOrMac}`);
-    }
+    const client = this.ensureClientExists(ipOrMac);
 
     client.max_download_limit = maxDownload;
     client.max_upload_limit = maxUpload;
@@ -1984,11 +2207,15 @@ class MikroTikService {
     let queue = this.queues.find((q) => q.target === targetSubnet);
 
     // Send real commands to RouterOS REST API
-    if (this.config.connected && client.ip_address) {
+    if (this.config.host && client.ip_address) {
       try {
         const routerQueues = await this.makeRouterOsRequest('/queue/simple', { timeoutMs: 3000 });
         const existingRouterQueue = Array.isArray(routerQueues)
-          ? routerQueues.find((q: any) => q.target === targetSubnet || q.name === `Limit-${client!.ip_address.replace(/\./g, '_')}`)
+          ? routerQueues.find(
+              (q: any) =>
+                q.target === targetSubnet ||
+                q.name === `Limit-${client.ip_address.replace(/\./g, '_')}`
+            )
           : null;
 
         if (maxDownload === 'Uncapped' || maxDownload === '0') {
@@ -2007,12 +2234,12 @@ class MikroTikService {
               method: 'PATCH',
               body: {
                 'max-limit': `${maxUpload}/${maxDownload}`,
-                disabled: 'false',
+                disabled: 'no',
               },
             });
           } else {
             console.log(`[MikroTik RouterOS] Creating speed limit queue for ${client.ip_address} (${maxUpload}/${maxDownload})`);
-            await this.makeRouterOsRequest('/queue/simple', {
+            const created = await this.makeRouterOsRequest('/queue/simple', {
               method: 'PUT',
               body: {
                 name: `Limit-${client.ip_address.replace(/\./g, '_')}`,
@@ -2021,6 +2248,9 @@ class MikroTikService {
                 comment: `Speed limit for ${client.alias || client.hostname} via Home Assistant`,
               },
             });
+            if (created && (created['.id'] || created.id)) {
+              client.queue_id = created['.id'] || created.id;
+            }
           }
         }
       } catch (err: any) {
@@ -2033,12 +2263,7 @@ class MikroTikService {
 
   // --- Multiple Restriction Time Slots ---
   public async setClientSchedules(ipOrMac: string, schedules: RestrictionTimeSlot[]) {
-    let client = this.clients.find(
-      (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
-    );
-    if (!client) {
-      throw new Error(`Device not found: ${ipOrMac}`);
-    }
+    const client = this.ensureClientExists(ipOrMac);
 
     client.schedules = schedules;
 
@@ -2052,295 +2277,9 @@ class MikroTikService {
     return client;
   }
 
-  public async syncClientFirewallRules(client: ClientDevice): Promise<void> {
-    if (!this.config.host || !client.ip_address) return;
-    const clientIp = client.ip_address;
-    const cleanIp = clientIp.replace(/\./g, '_');
-    const destListName = `ha_dest_${cleanIp}`;
-
-    try {
-      console.log(`[MikroTik RouterOS] Syncing rules for ${clientIp} (Blocked: ${client.is_blocked}, Games: ${client.blocked_games?.length || 0}, Sites: ${client.blocked_websites?.length || 0})...`);
-
-      // 1. IF CLIENT IS FULLY BLOCKED:
-      if (client.is_blocked) {
-        // Ensure base multi-chain drop rules at top of filter table
-        await this.ensureBaseDropRule();
-
-        // Ensure IP is in address-list
-        const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 }).catch(() => []);
-        const alreadyInList = Array.isArray(addrLists) && addrLists.some(
-          (a: any) => a.list === 'ha_blocked_users' && a.address === clientIp
-        );
-        if (!alreadyInList) {
-          console.log(`[MikroTik RouterOS] Adding ${clientIp} to ha_blocked_users address list...`);
-          await this.makeRouterOsRequest('/ip/firewall/address-list', {
-            method: 'PUT',
-            body: {
-              list: 'ha_blocked_users',
-              address: clientIp,
-              comment: `HA Block: ${client.alias || client.hostname}`,
-            },
-          }).catch(() => null);
-        }
-
-        // Add direct forward drop rule specifically for this IP at position 0
-        const existingFilters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => []);
-        const directFwComment = `HA Direct Block [${clientIp}]`;
-        const hasDirectFw = Array.isArray(existingFilters) && existingFilters.some((f: any) => f.comment === directFwComment);
-        if (!hasDirectFw) {
-          await this.addFilterRuleAtTop({
-            chain: 'forward',
-            action: 'drop',
-            'src-address': clientIp,
-            comment: directFwComment,
-          });
-        }
-
-        // Add direct input drop rule (blocks DNS resolution and router access)
-        const directInComment = `HA Direct DNS Block [${clientIp}]`;
-        const hasDirectIn = Array.isArray(existingFilters) && existingFilters.some((f: any) => f.comment === directInComment);
-        if (!hasDirectIn) {
-          await this.addFilterRuleAtTop({
-            chain: 'input',
-            action: 'drop',
-            'src-address': clientIp,
-            comment: directInComment,
-          });
-        }
-
-        // Flush active connections immediately
-        await this.flushClientConnections(clientIp);
-        return;
-      }
-
-      // 2. IF CLIENT IS UNBLOCKED:
-      // Remove from ha_blocked_users address-list
-      const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 }).catch(() => []);
-      if (Array.isArray(addrLists)) {
-        const matches = addrLists.filter((a: any) => a.list === 'ha_blocked_users' && a.address === clientIp);
-        for (const m of matches) {
-          const ruleId = m['.id'] || m.id;
-          if (ruleId) {
-            await this.makeRouterOsRequest(`/ip/firewall/address-list/${ruleId}`, { method: 'DELETE' }).catch(() => null);
-          }
-        }
-      }
-
-      // Remove direct block rules
-      const existingFilters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => []);
-      if (Array.isArray(existingFilters)) {
-        const directRules = existingFilters.filter((f: any) => (f.comment || '').includes(`[${clientIp}]`) && (f.comment || '').includes('HA Direct'));
-        for (const r of directRules) {
-          const ruleId = r['.id'] || r.id;
-          if (ruleId) {
-            await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => null);
-          }
-        }
-      }
-
-      // Clean up previous filter rules for this client
-      if (Array.isArray(existingFilters)) {
-        const oldFilterRules = existingFilters.filter((r: any) => {
-          const c = r.comment || '';
-          return (
-            c.includes(`[${clientIp}]`) &&
-            (c.includes('Shield') || c.includes('HA Filter') || c.includes('Game') || c.includes('Web') || c.includes('Custom'))
-          );
-        });
-        for (const r of oldFilterRules) {
-          const ruleId = r['.id'] || r.id;
-          if (ruleId) {
-            await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => null);
-          }
-        }
-      }
-
-      // Clean up previous destination address-list entries for this client
-      if (Array.isArray(addrLists)) {
-        const oldDestEntries = addrLists.filter((a: any) => a.list === destListName);
-        for (const a of oldDestEntries) {
-          const aId = a['.id'] || a.id;
-          if (aId) {
-            await this.makeRouterOsRequest(`/ip/firewall/address-list/${aId}`, { method: 'DELETE' }).catch(() => null);
-          }
-        }
-      }
-
-      // 3. Collect all domains and port rules to enforce
-      const allDomains: string[] = [];
-      const gameIds = client.blocked_games || [];
-      const websiteIds = client.blocked_websites || [];
-      const customDomains = (client.custom_blocked_domains || []).map((d) => d.trim().toLowerCase()).filter(Boolean);
-
-      for (const gId of gameIds) {
-        const game = POPULAR_GAMES.find((g) => g.id === gId);
-        if (game?.domains) allDomains.push(...game.domains);
-      }
-      for (const wId of websiteIds) {
-        const site = POPULAR_WEBSITES.find((s) => s.id === wId);
-        if (site?.domains) allDomains.push(...site.domains);
-      }
-      allDomains.push(...customDomains);
-      const uniqueDomains = Array.from(new Set(allDomains));
-
-      if (uniqueDomains.length === 0 && gameIds.length === 0) {
-        console.log(`[MikroTik RouterOS] No active filters remaining for ${clientIp}.`);
-        await this.flushClientConnections(clientIp);
-        return;
-      }
-
-      console.log(`[MikroTik RouterOS] Enforcing ${uniqueDomains.length} domains & game rules for ${clientIp}...`);
-
-      // LAYER 1: Address-list FQDN Destination Drop (RouterOS v7 auto-resolves all CDN IPs)
-      if (uniqueDomains.length > 0) {
-        for (const domain of uniqueDomains) {
-          await this.makeRouterOsRequest('/ip/firewall/address-list', {
-            method: 'PUT',
-            body: {
-              list: destListName,
-              address: domain,
-              comment: `HA Shield [${clientIp}]: ${domain}`,
-            },
-          }).catch(() => null);
-        }
-
-        // Add filter drop rule for this destination list at position 0
-        await this.addFilterRuleAtTop({
-          chain: 'forward',
-          action: 'drop',
-          'src-address': clientIp,
-          'dst-address-list': destListName,
-          comment: `HA Shield [${clientIp}]: Drop Blocked Dest IPs`,
-        });
-      }
-
-      // LAYER 2: Drop QUIC (UDP 443) for this client so browser cannot bypass TLS inspection
-      await this.addFilterRuleAtTop({
-        chain: 'forward',
-        action: 'drop',
-        protocol: 'udp',
-        'dst-port': '443',
-        'src-address': clientIp,
-        comment: `HA Shield [${clientIp}]: Drop QUIC 443 Bypass`,
-      });
-
-      // LAYER 3: Specific Popular Game Ports
-      for (const gId of gameIds) {
-        if (gId === 'roblox') {
-          await this.addFilterRuleAtTop({
-            chain: 'forward',
-            action: 'drop',
-            protocol: 'udp',
-            'dst-port': '49152-65535',
-            'src-address': clientIp,
-            comment: `HA Shield [${clientIp}]: Block Roblox UDP Game Traffic`,
-          });
-        } else if (gId === 'minecraft') {
-          await this.addFilterRuleAtTop({
-            chain: 'forward',
-            action: 'drop',
-            protocol: 'tcp',
-            'dst-port': '25565',
-            'src-address': clientIp,
-            comment: `HA Shield [${clientIp}]: Block Minecraft Java 25565`,
-          });
-          await this.addFilterRuleAtTop({
-            chain: 'forward',
-            action: 'drop',
-            protocol: 'udp',
-            'dst-port': '19132',
-            'src-address': clientIp,
-            comment: `HA Shield [${clientIp}]: Block Minecraft Bedrock 19132`,
-          });
-        } else if (gId === 'steam') {
-          await this.addFilterRuleAtTop({
-            chain: 'forward',
-            action: 'drop',
-            protocol: 'udp',
-            'dst-port': '27000-27050',
-            'src-address': clientIp,
-            comment: `HA Shield [${clientIp}]: Block Steam Game Traffic`,
-          });
-        } else if (gId === 'free_fire') {
-          await this.addFilterRuleAtTop({
-            chain: 'forward',
-            action: 'drop',
-            protocol: 'tcp',
-            'dst-port': '10006',
-            'src-address': clientIp,
-            comment: `HA Shield [${clientIp}]: Block Free Fire TCP 10006`,
-          });
-          await this.addFilterRuleAtTop({
-            chain: 'forward',
-            action: 'drop',
-            protocol: 'udp',
-            'dst-port': '7006',
-            'src-address': clientIp,
-            comment: `HA Shield [${clientIp}]: Block Free Fire UDP 7006`,
-          });
-        } else if (gId === 'pubg_mobile') {
-          await this.addFilterRuleAtTop({
-            chain: 'forward',
-            action: 'drop',
-            protocol: 'udp',
-            'dst-port': '10000-20000',
-            'src-address': clientIp,
-            comment: `HA Shield [${clientIp}]: Block PUBG Game Traffic`,
-          });
-        } else if (gId === 'valorant_riot') {
-          await this.addFilterRuleAtTop({
-            chain: 'forward',
-            action: 'drop',
-            protocol: 'tcp',
-            'dst-port': '2099,5223,8393',
-            'src-address': clientIp,
-            comment: `HA Shield [${clientIp}]: Block Riot Valorant Ports`,
-          });
-        }
-      }
-
-      // LAYER 4: TLS Host rules for primary domains
-      const topDomains = uniqueDomains.slice(0, 8);
-      for (const domain of topDomains) {
-        await this.addFilterRuleAtTop({
-          chain: 'forward',
-          action: 'drop',
-          protocol: 'tcp',
-          'dst-port': '443',
-          'src-address': clientIp,
-          'tls-host': `*${domain}*`,
-          comment: `HA Shield [${clientIp}]: TLS Host ${domain}`,
-        });
-      }
-
-      // LAYER 5: RouterOS DNS Static sinkhole
-      for (const domain of uniqueDomains.slice(0, 10)) {
-        await this.makeRouterOsRequest('/ip/dns/static', {
-          method: 'PUT',
-          body: {
-            name: domain,
-            address: '0.0.0.0',
-            comment: `HA Shield [${clientIp}]: ${domain}`,
-          },
-        }).catch(() => null);
-      }
-
-      // LAYER 6: Flush active connections for this client so ongoing streams terminate immediately!
-      await this.flushClientConnections(clientIp);
-
-    } catch (err: any) {
-      console.error(`[MikroTik RouterOS] Error syncing rules for ${clientIp}:`, err.message);
-    }
-  }
-
   // --- Popular Games Blocking ---
   public async setClientBlockedGames(ipOrMac: string, gameIds: string[]) {
-    let client = this.clients.find(
-      (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
-    );
-    if (!client) {
-      throw new Error(`Device not found: ${ipOrMac}`);
-    }
+    const client = this.ensureClientExists(ipOrMac);
 
     client.blocked_games = gameIds;
 
@@ -2353,7 +2292,7 @@ class MikroTikService {
 
     // 2. Synchronize in-memory firewall rules
     this.firewallRules = this.firewallRules.filter(
-      (r) => !r.comment?.includes(`[${client!.ip_address}]`) || !r.comment?.includes('Game')
+      (r) => !r.comment?.includes(`Game Shield [${client.ip_address}]`)
     );
 
     for (const gId of gameIds) {
@@ -2365,19 +2304,89 @@ class MikroTikService {
           chain: 'forward',
           action: 'drop',
           src_address: client.ip_address,
-          tls_host: game.domains ? `*${game.domains[0]}*` : undefined,
+          tls_host: `*${game.domains[0]}*`,
           packets: 0,
           bytes: 0,
           disabled: false,
-          comment: `HA Shield [${client.ip_address}]: Block ${game.name}`,
+          comment: `Game Shield [${client.ip_address}]: Block ${game.name}`,
         });
       }
     }
 
-    // 3. Synchronize to router hardware
+    // 3. Send real drop rules to MikroTik RouterOS firewall sequentially with lock
     if (this.config.host && client.ip_address) {
-      await this.syncClientFirewallRules(client).catch((err) => {
-        console.error(`[MikroTik RouterOS] Error syncing game filters for ${client.ip_address}:`, err.message);
+      await this.runWithFirewallLock(async () => {
+        try {
+          console.log(`[MikroTik RouterOS] Syncing game block rules for ${client.ip_address}:`, gameIds);
+          // Query active firewall filter rules from RouterOS
+          const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
+          if (Array.isArray(existingRules)) {
+            const toDelete = existingRules.filter((r: any) => {
+              const c = r.comment || '';
+              return c.includes(`Game Shield [${client.ip_address}]`) || c.includes(`HA Game [${client.ip_address}]`);
+            });
+
+            for (const oldRule of toDelete) {
+              const ruleId = oldRule['.id'] || oldRule.id;
+              if (ruleId) {
+                console.log(`[MikroTik RouterOS] Removing old game rule ${ruleId} (${oldRule.comment})`);
+                await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => {});
+              }
+            }
+          }
+
+          // Add rules for each game placed at the very top of the forward chain
+          for (const gId of gameIds) {
+            const game = POPULAR_GAMES.find((g) => g.id === gId);
+            if (!game) continue;
+
+            const targetDomains = (game.domains || []).slice(0, 3);
+            for (const domain of targetDomains) {
+              console.log(`[MikroTik RouterOS] Adding TLS host rule for ${game.name} (${domain}) on ${client.ip_address}`);
+              await this.addFirewallFilterRuleToRouter({
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'tcp',
+                'dst-port': '443',
+                'src-address': client.ip_address,
+                'tls-host': `*${domain}*`,
+                comment: `Game Shield [${client.ip_address}]: Block ${game.name} (${domain})`,
+              }).catch((err) => {
+                console.error(`[MikroTik RouterOS] Error creating TLS rule for ${domain}:`, err.message);
+              });
+            }
+
+            if (game.id === 'roblox') {
+              await this.addFirewallFilterRuleToRouter({
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'udp',
+                'dst-port': '49152-65535',
+                'src-address': client.ip_address,
+                comment: `Game Shield [${client.ip_address}]: Block Roblox UDP Ports`,
+              }).catch(() => {});
+            } else if (game.id === 'minecraft') {
+              await this.addFirewallFilterRuleToRouter({
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'tcp',
+                'dst-port': '25565',
+                'src-address': client.ip_address,
+                comment: `Game Shield [${client.ip_address}]: Block Minecraft Java 25565`,
+              }).catch(() => {});
+              await this.addFirewallFilterRuleToRouter({
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'udp',
+                'dst-port': '19132',
+                'src-address': client.ip_address,
+                comment: `Game Shield [${client.ip_address}]: Block Minecraft Bedrock 19132`,
+              }).catch(() => {});
+            }
+          }
+        } catch (err: any) {
+          console.error(`[MikroTik RouterOS] Error applying game filters for ${client.ip_address}:`, err.message);
+        }
       });
     }
 
@@ -2386,12 +2395,7 @@ class MikroTikService {
 
   // --- Popular Websites & Custom Domains Blocking ---
   public async setClientBlockedWebsites(ipOrMac: string, websiteIds: string[], customDomains: string[]) {
-    let client = this.clients.find(
-      (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
-    );
-    if (!client) {
-      throw new Error(`Device not found: ${ipOrMac}`);
-    }
+    const client = this.ensureClientExists(ipOrMac);
 
     client.blocked_websites = websiteIds;
     client.custom_blocked_domains = customDomains;
@@ -2406,7 +2410,7 @@ class MikroTikService {
 
     // 2. Synchronize in-memory rules
     this.firewallRules = this.firewallRules.filter(
-      (r) => !r.comment?.includes(`[${client!.ip_address}]`) || (!r.comment?.includes('Web') && !r.comment?.includes('Custom'))
+      (r) => !r.comment?.includes(`Web Shield [${client.ip_address}]`)
     );
 
     for (const wId of websiteIds) {
@@ -2418,39 +2422,119 @@ class MikroTikService {
           chain: 'forward',
           action: 'drop',
           src_address: client.ip_address,
-          tls_host: site.domains ? `*${site.domains[0]}*` : undefined,
+          tls_host: `*${site.domains[0]}*`,
           packets: 0,
           bytes: 0,
           disabled: false,
-          comment: `HA Shield [${client.ip_address}]: Block ${site.name}`,
+          comment: `Web Shield [${client.ip_address}]: Block ${site.name}`,
         });
       }
     }
 
     for (const domain of customDomains) {
-      const clean = domain.trim();
-      if (!clean) continue;
+      if (!domain.trim()) continue;
       this.firewallRules.unshift({
         id: `fw-custom-${client.id}-${Date.now()}`,
         order: 2,
         chain: 'forward',
         action: 'drop',
         src_address: client.ip_address,
-        tls_host: `*${clean}*`,
+        tls_host: `*${domain.trim()}*`,
         packets: 0,
         bytes: 0,
         disabled: false,
-        comment: `HA Shield [${client.ip_address}]: Custom ${clean}`,
+        comment: `Web Shield [${client.ip_address}]: Custom ${domain.trim()}`,
       });
     }
 
-    // 3. Synchronize to router hardware
+    // 3. Send real commands to RouterOS REST API sequentially with lock
     if (this.config.host && client.ip_address) {
-      await this.syncClientFirewallRules(client).catch((err) => {
-        console.error(`[MikroTik RouterOS] Error syncing website filters for ${client.ip_address}:`, err.message);
+      await this.runWithFirewallLock(async () => {
+        try {
+          console.log(`[MikroTik RouterOS] Syncing website filters for ${client.ip_address}:`, websiteIds, customDomains);
+          const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
+          if (Array.isArray(existingRules)) {
+            const toDelete = existingRules.filter((r: any) => {
+              const c = r.comment || '';
+              return c.includes(`Web Shield [${client.ip_address}]`) || c.includes(`HA Web [${client.ip_address}]`);
+            });
+
+            for (const oldRule of toDelete) {
+              const ruleId = oldRule['.id'] || oldRule.id;
+              if (ruleId) {
+                console.log(`[MikroTik RouterOS] Removing old web rule ${ruleId} (${oldRule.comment})`);
+                await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => {});
+              }
+            }
+          }
+
+          // If any site or custom domain is blocked, block UDP 443 (QUIC) so browser cannot bypass TLS inspection
+          if (websiteIds.length > 0 || customDomains.length > 0) {
+            await this.addFirewallFilterRuleToRouter({
+              chain: 'forward',
+              action: 'drop',
+              protocol: 'udp',
+              'dst-port': '443',
+              'src-address': client.ip_address,
+              comment: `Web Shield [${client.ip_address}]: Block QUIC Bypass`,
+            }).catch(() => {});
+          }
+
+          for (const wId of websiteIds) {
+            const site = POPULAR_WEBSITES.find((s) => s.id === wId);
+            if (!site) continue;
+
+            const targetDomains = (site.domains || []).slice(0, 3);
+            for (const domain of targetDomains) {
+              console.log(`[MikroTik RouterOS] Adding TLS host rule for ${site.name} (${domain}) on ${client.ip_address}`);
+              await this.addFirewallFilterRuleToRouter({
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'tcp',
+                'dst-port': '443',
+                'src-address': client.ip_address,
+                'tls-host': `*${domain}*`,
+                comment: `Web Shield [${client.ip_address}]: Block ${site.name} (${domain})`,
+              }).catch((err) => {
+                console.error(`[MikroTik RouterOS] Error creating TLS rule for ${domain}:`, err.message);
+              });
+            }
+          }
+
+          for (const domain of customDomains) {
+            const clean = domain.trim();
+            if (!clean) continue;
+            await this.addFirewallFilterRuleToRouter({
+              chain: 'forward',
+              action: 'drop',
+              protocol: 'tcp',
+              'dst-port': '443',
+              'src-address': client.ip_address,
+              'tls-host': `*${clean}*`,
+              comment: `Web Shield [${client.ip_address}]: Custom ${clean}`,
+            }).catch((err) => {
+              console.error(`[MikroTik RouterOS] Error creating rule for ${clean}:`, err.message);
+            });
+          }
+        } catch (err: any) {
+          console.error(`[MikroTik RouterOS] Error applying website filters for ${client.ip_address}:`, err.message);
+        }
       });
     }
 
+    return client;
+  }
+
+  // --- Combined Content Filter Sync (Games + Websites + Custom) ---
+  public async setClientContentFilter(
+    ipOrMac: string,
+    gameIds: string[],
+    websiteIds: string[],
+    customDomains: string[]
+  ) {
+    const client = this.ensureClientExists(ipOrMac);
+    await this.setClientBlockedGames(client.ip_address, gameIds);
+    await this.setClientBlockedWebsites(client.ip_address, websiteIds, customDomains);
     return client;
   }
 
@@ -2462,12 +2546,7 @@ class MikroTikService {
   }
 
   public async setClientAlias(ipOrMac: string, alias: string) {
-    let client = this.clients.find(
-      (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
-    );
-    if (!client) {
-      throw new Error(`Device not found: ${ipOrMac}`);
-    }
+    const client = this.ensureClientExists(ipOrMac);
     client.alias = alias;
 
     if (!this.persistedClientsState[client.ip_address]) {
@@ -2476,11 +2555,11 @@ class MikroTikService {
     this.persistedClientsState[client.ip_address].alias = alias;
     this.savePersistedState();
 
-    if (this.config.connected && client.ip_address) {
+    if (this.config.host && client.ip_address) {
       try {
         const leases = await this.makeRouterOsRequest('/ip/dhcp-server/lease', { timeoutMs: 3000 });
         if (Array.isArray(leases)) {
-          const match = leases.find((l: any) => (l['active-address'] || l.address) === client!.ip_address);
+          const match = leases.find((l: any) => (l['active-address'] || l.address) === client.ip_address);
           if (match && (match['.id'] || match.id)) {
             await this.makeRouterOsRequest(`/ip/dhcp-server/lease/${match['.id'] || match.id}`, {
               method: 'PATCH',
@@ -2527,7 +2606,7 @@ class MikroTikService {
       comment: newQueue.comment || 'Created from Home Assistant MikroTik Manager',
     };
 
-    if (this.config.connected) {
+    if (this.config.host) {
       try {
         const res = await this.makeRouterOsRequest('/queue/simple', {
           method: 'PUT',
@@ -2557,7 +2636,7 @@ class MikroTikService {
 
     Object.assign(q, updates);
 
-    if (this.config.connected) {
+    if (this.config.host) {
       try {
         const body: any = {};
         if (updates.max_limit_upload && updates.max_limit_download) {
@@ -2592,7 +2671,7 @@ class MikroTikService {
       cl.max_upload_limit = 'Uncapped';
     }
 
-    if (this.config.connected) {
+    if (this.config.host) {
       try {
         await this.makeRouterOsRequest(`/queue/simple/${id}`, { method: 'DELETE' });
       } catch (err: any) {
@@ -2609,7 +2688,7 @@ class MikroTikService {
     return this.schedules;
   }
 
-  public createSchedule(newSch: Partial<RouterSchedule>): RouterSchedule {
+  public async createSchedule(newSch: Partial<RouterSchedule>): Promise<RouterSchedule> {
     if (!newSch.name || !newSch.on_event) {
       throw new Error('Schedule name and script on_event command are required');
     }
@@ -2627,28 +2706,90 @@ class MikroTikService {
       comment: newSch.comment || 'Custom HA automation schedule',
     };
 
+    if (this.config.host) {
+      try {
+        const res = await this.makeRouterOsRequest('/system/scheduler', {
+          method: 'PUT',
+          body: {
+            name: item.name,
+            'start-time': item.start_time,
+            interval: item.interval,
+            'on-event': item.on_event,
+            comment: item.comment,
+            disabled: item.disabled ? 'yes' : 'no',
+          },
+        });
+        if (res && (res['.id'] || res.id || res.ret)) {
+          item.id = res['.id'] || res.id || res.ret;
+        }
+      } catch (err: any) {
+        console.error('[MikroTik RouterOS] Error creating schedule on router:', err.message);
+      }
+    }
+
     this.schedules.push(item);
     return item;
   }
 
-  public updateSchedule(id: string, updates: Partial<RouterSchedule>): RouterSchedule {
+  public async updateSchedule(id: string, updates: Partial<RouterSchedule>): Promise<RouterSchedule> {
     const sch = this.schedules.find((x) => x.id === id);
     if (!sch) throw new Error(`Schedule not found: ${id}`);
     Object.assign(sch, updates);
+
+    if (this.config.host) {
+      try {
+        const body: any = {};
+        if (updates.name) body.name = updates.name;
+        if (updates.start_time) body['start-time'] = updates.start_time;
+        if (updates.interval) body.interval = updates.interval;
+        if (updates.on_event) body['on-event'] = updates.on_event;
+        if (updates.comment) body.comment = updates.comment;
+        if (updates.disabled !== undefined) body.disabled = updates.disabled ? 'yes' : 'no';
+
+        await this.makeRouterOsRequest(`/system/scheduler/${id}`, {
+          method: 'PATCH',
+          body,
+        });
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Error updating schedule ${id}:`, err.message);
+      }
+    }
+
     return sch;
   }
 
-  public deleteSchedule(id: string) {
+  public async deleteSchedule(id: string) {
     const idx = this.schedules.findIndex((x) => x.id === id);
     if (idx === -1) throw new Error(`Schedule not found: ${id}`);
-    return this.schedules.splice(idx, 1)[0];
+    const removed = this.schedules.splice(idx, 1)[0];
+
+    if (this.config.host) {
+      try {
+        await this.makeRouterOsRequest(`/system/scheduler/${id}`, { method: 'DELETE' });
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Error deleting schedule ${id}:`, err.message);
+      }
+    }
+
+    return removed;
   }
 
-  public runScheduleNow(id: string) {
+  public async runScheduleNow(id: string) {
     const sch = this.schedules.find((x) => x.id === id);
     if (!sch) throw new Error(`Schedule not found: ${id}`);
     sch.run_count += 1;
     sch.next_run = `Triggered just now`;
+
+    if (this.config.host) {
+      try {
+        // Run scheduled script event on RouterOS
+        await this.makeRouterOsRequest('/system/script/run', {
+          method: 'POST',
+          body: { script: sch.on_event, number: id },
+        }).catch(() => {});
+      } catch {}
+    }
+
     return { success: true, message: `Schedule "${sch.name}" executed successfully on RouterOS.`, sch };
   }
 
@@ -2689,7 +2830,7 @@ class MikroTikService {
       comment: newRule.comment || 'Added via HA MikroTik Manager',
     };
 
-    if (this.config.connected) {
+    if (this.config.host) {
       try {
         const body: any = {
           chain: rule.chain,
@@ -2699,7 +2840,11 @@ class MikroTikService {
         if (rule.dst_address) body['dst-address'] = rule.dst_address;
         if (rule.src_address_list) body['src-address-list'] = rule.src_address_list;
         if (rule.dst_address_list) body['dst-address-list'] = rule.dst_address_list;
-        if (rule.protocol) body['protocol'] = rule.protocol;
+        if (rule.protocol) {
+          body['protocol'] = rule.protocol;
+        } else if (rule.tls_host || rule.dst_port) {
+          body['protocol'] = 'tcp';
+        }
         if (rule.dst_port) body['dst-port'] = rule.dst_port;
         if (rule.tls_host) body['tls-host'] = rule.tls_host;
         if (rule.comment) body['comment'] = rule.comment;
@@ -2726,7 +2871,7 @@ class MikroTikService {
     if (!r) throw new Error(`Rule not found: ${id}`);
     Object.assign(r, updates);
 
-    if (this.config.connected) {
+    if (this.config.host) {
       try {
         const body: any = {};
         if (updates.disabled !== undefined) body.disabled = updates.disabled ? 'yes' : 'no';
@@ -2750,7 +2895,7 @@ class MikroTikService {
     if (idx === -1) throw new Error(`Rule not found: ${id}`);
     const removed = this.firewallRules.splice(idx, 1)[0];
 
-    if (this.config.connected) {
+    if (this.config.host) {
       try {
         await this.makeRouterOsRequest(`/ip/firewall/filter/${id}`, { method: 'DELETE' });
       } catch (err: any) {
@@ -2764,7 +2909,7 @@ class MikroTikService {
   public async togglePanicKillswitch(active: boolean) {
     this.panicKillswitchActive = active;
 
-    if (this.config.connected) {
+    if (this.config.host) {
       try {
         const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
         const dropRule = Array.isArray(existingRules)
@@ -2778,12 +2923,14 @@ class MikroTikService {
               method: 'PATCH',
               body: { disabled: 'no' },
             });
-            await this.moveFilterRuleToTop(ruleId);
           } else {
-            await this.addFilterRuleAtTop({
-              chain: 'forward',
-              action: 'drop',
-              comment: 'HA Panic Emergency Killswitch: Block all forwarding Internet traffic',
+            await this.makeRouterOsRequest('/ip/firewall/filter', {
+              method: 'PUT',
+              body: {
+                chain: 'forward',
+                action: 'drop',
+                comment: 'HA Panic Emergency Killswitch: Block all forwarding Internet traffic',
+              },
             });
           }
         } else {

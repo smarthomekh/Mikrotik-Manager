@@ -103,7 +103,42 @@ export const Header: React.FC<HeaderProps> = ({
         </nav>
 
         {/* Zone 3: Primary Action / Controls */}
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex items-center gap-2.5 shrink-0">
+          {/* Router Connection Status Indicator & Quick Setup Button */}
+          <button
+            onClick={onOpenSettings}
+            title="Configure MikroTik Router Connection"
+            className="flex items-center gap-2 px-3 py-1.5 rounded-lg border transition-all text-xs font-mono cursor-pointer bg-slate-900 border-slate-800 hover:border-slate-700"
+          >
+            <span
+              className={`w-2 h-2 rounded-full shrink-0 ${
+                config?.connected
+                  ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)] animate-pulse'
+                  : 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.5)]'
+              }`}
+            />
+            <span className="text-slate-300 font-medium hidden sm:inline">
+              {config?.host ? `${config.host}:${config.port}` : 'Configure Router'}
+            </span>
+            <span
+              className={`text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded ${
+                config?.connected
+                  ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                  : 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
+              }`}
+            >
+              {config?.connected ? 'Online' : 'Setup'}
+            </span>
+          </button>
+
+          <button
+            onClick={onOpenSettings}
+            title="Connection Settings"
+            className="p-2 text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 rounded-lg transition-colors border border-slate-800 cursor-pointer"
+          >
+            <Settings className="w-4 h-4" />
+          </button>
+
           <button
             onClick={onRefresh}
             title="Refresh Router Data"
