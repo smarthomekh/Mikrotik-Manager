@@ -902,31 +902,188 @@ class MikroTikService {
     }
   }
 
+  private async moveFilterRuleToTop(ruleId: string): Promise<void> {
+    if (!ruleId || !this.config.host) return;
+    try {
+      // 1. Try standard REST move with destination "0"
+      await this.makeRouterOsRequest('/ip/firewall/filter/move', {
+        method: 'POST',
+        body: {
+          '.id': ruleId,
+          destination: '0',
+        },
+      });
+      console.log(`[MikroTik RouterOS] Rule ${ruleId} moved to position 0.`);
+      return;
+    } catch (err1: any) {
+      // 2. Try destination targeting the first existing rule
+      try {
+        const filters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 }).catch(() => null);
+        if (Array.isArray(filters) && filters.length > 0) {
+          const firstId = filters[0]['.id'] || filters[0].id;
+          if (firstId && firstId !== ruleId) {
+            await this.makeRouterOsRequest('/ip/firewall/filter/move', {
+              method: 'POST',
+              body: {
+                '.id': ruleId,
+                destination: firstId,
+              },
+            });
+            console.log(`[MikroTik RouterOS] Rule ${ruleId} moved before first rule ${firstId}.`);
+            return;
+          }
+        }
+      } catch (err2: any) {}
+
+      // 3. Try with numbers parameter
+      try {
+        await this.makeRouterOsRequest('/ip/firewall/filter/move', {
+          method: 'POST',
+          body: {
+            numbers: ruleId,
+            destination: '0',
+          },
+        });
+        console.log(`[MikroTik RouterOS] Rule ${ruleId} moved to 0 using numbers.`);
+      } catch (err3: any) {
+        console.warn(`[MikroTik RouterOS] Note on rule ordering for ${ruleId}:`, err3.message || err1.message);
+      }
+    }
+  }
+
+  private async addFilterRuleAtTop(ruleBody: Record<string, any>): Promise<string | null> {
+    try {
+      const res = await this.makeRouterOsRequest('/ip/firewall/filter', {
+        method: 'PUT',
+        body: ruleBody,
+      });
+      let ruleId = res?.['.id'] || res?.ret || (typeof res === 'string' && res.startsWith('*') ? res : null);
+      if (!ruleId && ruleBody.comment) {
+        const all = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 }).catch(() => null);
+        if (Array.isArray(all)) {
+          const found = all.find((r: any) => r.comment === ruleBody.comment);
+          if (found) ruleId = found['.id'] || found.id;
+        }
+      }
+      if (ruleId) {
+        await this.moveFilterRuleToTop(ruleId);
+        return ruleId;
+      }
+    } catch (err: any) {
+      console.warn(`[MikroTik RouterOS] Error creating filter rule (${ruleBody.comment}):`, err.message);
+    }
+    return null;
+  }
+
+  private async flushClientConnections(clientIp: string): Promise<void> {
+    if (!clientIp || !this.config.host) return;
+    try {
+      console.log(`[MikroTik RouterOS] Checking active connections for ${clientIp} to flush...`);
+      const conns = await this.makeRouterOsRequest('/ip/firewall/connection', { timeoutMs: 3500 }).catch(() => null);
+      if (Array.isArray(conns) && conns.length > 0) {
+        const matches = conns.filter((c: any) => {
+          const src = c['src-address'] || '';
+          const dst = c['dst-address'] || '';
+          const replyDst = c['reply-dst-address'] || '';
+          const replySrc = c['reply-src-address'] || '';
+          return (
+            src.startsWith(`${clientIp}:`) ||
+            dst.startsWith(`${clientIp}:`) ||
+            replyDst.startsWith(`${clientIp}:`) ||
+            replySrc.startsWith(`${clientIp}:`)
+          );
+        });
+
+        if (matches.length > 0) {
+          console.log(`[MikroTik RouterOS] Terminating ${matches.length} active connection(s) for ${clientIp}`);
+          // 1. Try bulk remove
+          const idList = matches.map((c: any) => c['.id'] || c.id).filter(Boolean).slice(0, 40).join(',');
+          if (idList) {
+            await this.makeRouterOsRequest('/ip/firewall/connection/remove', {
+              method: 'POST',
+              body: { numbers: idList },
+            }).catch(() => null);
+          }
+
+          // 2. Individual DELETE fallback for remaining
+          for (const conn of matches.slice(0, 30)) {
+            const connId = conn['.id'] || conn.id;
+            if (connId) {
+              await this.makeRouterOsRequest(`/ip/firewall/connection/${connId}`, {
+                method: 'DELETE',
+              }).catch(() => null);
+            }
+          }
+        }
+      }
+    } catch (err: any) {
+      console.warn(`[MikroTik RouterOS] Note flushing connections for ${clientIp}:`, err.message);
+    }
+  }
+
   private async ensureBaseDropRule(): Promise<void> {
     try {
-      const filters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 });
+      const filters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => null);
       if (Array.isArray(filters)) {
-        const hasRule = filters.some(
+        // 1. Outbound forward drop (devices -> internet)
+        const hasOutbound = filters.find(
           (f: any) =>
             f.chain === 'forward' &&
             f.action === 'drop' &&
             (f['src-address-list'] === 'ha_blocked_users' || f.src_address_list === 'ha_blocked_users')
         );
-        if (!hasRule) {
-          console.log('[MikroTik RouterOS] Creating base forward drop rule for ha_blocked_users...');
-          await this.makeRouterOsRequest('/ip/firewall/filter', {
-            method: 'PUT',
-            body: {
-              chain: 'forward',
-              action: 'drop',
-              'src-address-list': 'ha_blocked_users',
-              comment: 'HA Drop Blocked Devices',
-            },
+        if (!hasOutbound) {
+          console.log('[MikroTik RouterOS] Creating base outbound drop rule for ha_blocked_users at top...');
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            'src-address-list': 'ha_blocked_users',
+            comment: 'HA Drop Blocked Users Outbound',
           });
+        } else {
+          await this.moveFilterRuleToTop(hasOutbound['.id'] || hasOutbound.id);
+        }
+
+        // 2. Inbound forward drop (internet -> devices)
+        const hasInbound = filters.find(
+          (f: any) =>
+            f.chain === 'forward' &&
+            f.action === 'drop' &&
+            (f['dst-address-list'] === 'ha_blocked_users' || f.dst_address_list === 'ha_blocked_users')
+        );
+        if (!hasInbound) {
+          console.log('[MikroTik RouterOS] Creating base inbound drop rule for ha_blocked_users at top...');
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            'dst-address-list': 'ha_blocked_users',
+            comment: 'HA Drop Blocked Users Inbound',
+          });
+        } else {
+          await this.moveFilterRuleToTop(hasInbound['.id'] || hasInbound.id);
+        }
+
+        // 3. Local router services input drop (stops blocked devices querying DNS or accessing router)
+        const hasInput = filters.find(
+          (f: any) =>
+            f.chain === 'input' &&
+            f.action === 'drop' &&
+            (f['src-address-list'] === 'ha_blocked_users' || f.src_address_list === 'ha_blocked_users')
+        );
+        if (!hasInput) {
+          console.log('[MikroTik RouterOS] Creating base input drop rule for ha_blocked_users at top...');
+          await this.addFilterRuleAtTop({
+            chain: 'input',
+            action: 'drop',
+            'src-address-list': 'ha_blocked_users',
+            comment: 'HA Drop Blocked Users Local/DNS Services',
+          });
+        } else {
+          await this.moveFilterRuleToTop(hasInput['.id'] || hasInput.id);
         }
       }
     } catch (err: any) {
-      console.warn('[MikroTik RouterOS] Could not verify/create base drop rule for ha_blocked_users:', err.message);
+      console.warn('[MikroTik RouterOS] Could not verify/create base drop rules for ha_blocked_users:', err.message);
     }
   }
 
@@ -1313,6 +1470,21 @@ class MikroTikService {
                 dhcp_status: l.status || 'bound',
               };
             });
+
+            // On initial sync, ensure all saved blocks and filter rules are actively placed at top of router firewall
+            if (this.syncCount === 3) {
+              this.ensureBaseDropRule().catch(() => null);
+              for (const c of this.clients) {
+                if (
+                  c.is_blocked ||
+                  (c.blocked_games && c.blocked_games.length > 0) ||
+                  (c.blocked_websites && c.blocked_websites.length > 0) ||
+                  (c.custom_blocked_domains && c.custom_blocked_domains.length > 0)
+                ) {
+                  this.syncClientFirewallRules(c).catch(() => null);
+                }
+              }
+            }
           }
 
           if (Array.isArray(qs)) {
@@ -1780,50 +1952,10 @@ class MikroTikService {
     }
 
     // Send real commands to RouterOS REST API
-    if (this.config.connected && client.ip_address) {
-      try {
-        if (block) {
-          // 1. Ensure forward drop rule exists in /ip/firewall/filter
-          await this.ensureBaseDropRule();
-
-          // 2. Query address lists to see if already present
-          const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 });
-          const alreadyInList = Array.isArray(addrLists) && addrLists.some(
-            (a: any) => a.list === 'ha_blocked_users' && a.address === client!.ip_address
-          );
-
-          if (!alreadyInList) {
-            console.log(`[MikroTik RouterOS] Adding ${client.ip_address} to ha_blocked_users address list...`);
-            await this.makeRouterOsRequest('/ip/firewall/address-list', {
-              method: 'PUT',
-              body: {
-                list: 'ha_blocked_users',
-                address: client.ip_address,
-                comment: `Blocked via Home Assistant: ${client.alias || client.hostname}`,
-              },
-            });
-          }
-        } else {
-          // Unblock: find entry on RouterOS and delete it
-          const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 });
-          if (Array.isArray(addrLists)) {
-            const matches = addrLists.filter(
-              (a: any) => a.list === 'ha_blocked_users' && a.address === client!.ip_address
-            );
-            for (const m of matches) {
-              const ruleId = m['.id'] || m.id;
-              if (ruleId) {
-                console.log(`[MikroTik RouterOS] Removing ${client.ip_address} (ID ${ruleId}) from ha_blocked_users...`);
-                await this.makeRouterOsRequest(`/ip/firewall/address-list/${ruleId}`, {
-                  method: 'DELETE',
-                });
-              }
-            }
-          }
-        }
-      } catch (err: any) {
-        console.error(`[MikroTik RouterOS] Failed to update router address list for ${client.ip_address}:`, err.message);
-      }
+    if (this.config.host && client.ip_address) {
+      await this.syncClientFirewallRules(client).catch((err) => {
+        console.error(`[MikroTik RouterOS] Error syncing block rules for ${client.ip_address}:`, err.message);
+      });
     }
 
     return client;
@@ -1920,6 +2052,287 @@ class MikroTikService {
     return client;
   }
 
+  public async syncClientFirewallRules(client: ClientDevice): Promise<void> {
+    if (!this.config.host || !client.ip_address) return;
+    const clientIp = client.ip_address;
+    const cleanIp = clientIp.replace(/\./g, '_');
+    const destListName = `ha_dest_${cleanIp}`;
+
+    try {
+      console.log(`[MikroTik RouterOS] Syncing rules for ${clientIp} (Blocked: ${client.is_blocked}, Games: ${client.blocked_games?.length || 0}, Sites: ${client.blocked_websites?.length || 0})...`);
+
+      // 1. IF CLIENT IS FULLY BLOCKED:
+      if (client.is_blocked) {
+        // Ensure base multi-chain drop rules at top of filter table
+        await this.ensureBaseDropRule();
+
+        // Ensure IP is in address-list
+        const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 }).catch(() => []);
+        const alreadyInList = Array.isArray(addrLists) && addrLists.some(
+          (a: any) => a.list === 'ha_blocked_users' && a.address === clientIp
+        );
+        if (!alreadyInList) {
+          console.log(`[MikroTik RouterOS] Adding ${clientIp} to ha_blocked_users address list...`);
+          await this.makeRouterOsRequest('/ip/firewall/address-list', {
+            method: 'PUT',
+            body: {
+              list: 'ha_blocked_users',
+              address: clientIp,
+              comment: `HA Block: ${client.alias || client.hostname}`,
+            },
+          }).catch(() => null);
+        }
+
+        // Add direct forward drop rule specifically for this IP at position 0
+        const existingFilters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => []);
+        const directFwComment = `HA Direct Block [${clientIp}]`;
+        const hasDirectFw = Array.isArray(existingFilters) && existingFilters.some((f: any) => f.comment === directFwComment);
+        if (!hasDirectFw) {
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            'src-address': clientIp,
+            comment: directFwComment,
+          });
+        }
+
+        // Add direct input drop rule (blocks DNS resolution and router access)
+        const directInComment = `HA Direct DNS Block [${clientIp}]`;
+        const hasDirectIn = Array.isArray(existingFilters) && existingFilters.some((f: any) => f.comment === directInComment);
+        if (!hasDirectIn) {
+          await this.addFilterRuleAtTop({
+            chain: 'input',
+            action: 'drop',
+            'src-address': clientIp,
+            comment: directInComment,
+          });
+        }
+
+        // Flush active connections immediately
+        await this.flushClientConnections(clientIp);
+        return;
+      }
+
+      // 2. IF CLIENT IS UNBLOCKED:
+      // Remove from ha_blocked_users address-list
+      const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 }).catch(() => []);
+      if (Array.isArray(addrLists)) {
+        const matches = addrLists.filter((a: any) => a.list === 'ha_blocked_users' && a.address === clientIp);
+        for (const m of matches) {
+          const ruleId = m['.id'] || m.id;
+          if (ruleId) {
+            await this.makeRouterOsRequest(`/ip/firewall/address-list/${ruleId}`, { method: 'DELETE' }).catch(() => null);
+          }
+        }
+      }
+
+      // Remove direct block rules
+      const existingFilters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => []);
+      if (Array.isArray(existingFilters)) {
+        const directRules = existingFilters.filter((f: any) => (f.comment || '').includes(`[${clientIp}]`) && (f.comment || '').includes('HA Direct'));
+        for (const r of directRules) {
+          const ruleId = r['.id'] || r.id;
+          if (ruleId) {
+            await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => null);
+          }
+        }
+      }
+
+      // Clean up previous filter rules for this client
+      if (Array.isArray(existingFilters)) {
+        const oldFilterRules = existingFilters.filter((r: any) => {
+          const c = r.comment || '';
+          return (
+            c.includes(`[${clientIp}]`) &&
+            (c.includes('Shield') || c.includes('HA Filter') || c.includes('Game') || c.includes('Web') || c.includes('Custom'))
+          );
+        });
+        for (const r of oldFilterRules) {
+          const ruleId = r['.id'] || r.id;
+          if (ruleId) {
+            await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => null);
+          }
+        }
+      }
+
+      // Clean up previous destination address-list entries for this client
+      if (Array.isArray(addrLists)) {
+        const oldDestEntries = addrLists.filter((a: any) => a.list === destListName);
+        for (const a of oldDestEntries) {
+          const aId = a['.id'] || a.id;
+          if (aId) {
+            await this.makeRouterOsRequest(`/ip/firewall/address-list/${aId}`, { method: 'DELETE' }).catch(() => null);
+          }
+        }
+      }
+
+      // 3. Collect all domains and port rules to enforce
+      const allDomains: string[] = [];
+      const gameIds = client.blocked_games || [];
+      const websiteIds = client.blocked_websites || [];
+      const customDomains = (client.custom_blocked_domains || []).map((d) => d.trim().toLowerCase()).filter(Boolean);
+
+      for (const gId of gameIds) {
+        const game = POPULAR_GAMES.find((g) => g.id === gId);
+        if (game?.domains) allDomains.push(...game.domains);
+      }
+      for (const wId of websiteIds) {
+        const site = POPULAR_WEBSITES.find((s) => s.id === wId);
+        if (site?.domains) allDomains.push(...site.domains);
+      }
+      allDomains.push(...customDomains);
+      const uniqueDomains = Array.from(new Set(allDomains));
+
+      if (uniqueDomains.length === 0 && gameIds.length === 0) {
+        console.log(`[MikroTik RouterOS] No active filters remaining for ${clientIp}.`);
+        await this.flushClientConnections(clientIp);
+        return;
+      }
+
+      console.log(`[MikroTik RouterOS] Enforcing ${uniqueDomains.length} domains & game rules for ${clientIp}...`);
+
+      // LAYER 1: Address-list FQDN Destination Drop (RouterOS v7 auto-resolves all CDN IPs)
+      if (uniqueDomains.length > 0) {
+        for (const domain of uniqueDomains) {
+          await this.makeRouterOsRequest('/ip/firewall/address-list', {
+            method: 'PUT',
+            body: {
+              list: destListName,
+              address: domain,
+              comment: `HA Shield [${clientIp}]: ${domain}`,
+            },
+          }).catch(() => null);
+        }
+
+        // Add filter drop rule for this destination list at position 0
+        await this.addFilterRuleAtTop({
+          chain: 'forward',
+          action: 'drop',
+          'src-address': clientIp,
+          'dst-address-list': destListName,
+          comment: `HA Shield [${clientIp}]: Drop Blocked Dest IPs`,
+        });
+      }
+
+      // LAYER 2: Drop QUIC (UDP 443) for this client so browser cannot bypass TLS inspection
+      await this.addFilterRuleAtTop({
+        chain: 'forward',
+        action: 'drop',
+        protocol: 'udp',
+        'dst-port': '443',
+        'src-address': clientIp,
+        comment: `HA Shield [${clientIp}]: Drop QUIC 443 Bypass`,
+      });
+
+      // LAYER 3: Specific Popular Game Ports
+      for (const gId of gameIds) {
+        if (gId === 'roblox') {
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            protocol: 'udp',
+            'dst-port': '49152-65535',
+            'src-address': clientIp,
+            comment: `HA Shield [${clientIp}]: Block Roblox UDP Game Traffic`,
+          });
+        } else if (gId === 'minecraft') {
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            protocol: 'tcp',
+            'dst-port': '25565',
+            'src-address': clientIp,
+            comment: `HA Shield [${clientIp}]: Block Minecraft Java 25565`,
+          });
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            protocol: 'udp',
+            'dst-port': '19132',
+            'src-address': clientIp,
+            comment: `HA Shield [${clientIp}]: Block Minecraft Bedrock 19132`,
+          });
+        } else if (gId === 'steam') {
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            protocol: 'udp',
+            'dst-port': '27000-27050',
+            'src-address': clientIp,
+            comment: `HA Shield [${clientIp}]: Block Steam Game Traffic`,
+          });
+        } else if (gId === 'free_fire') {
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            protocol: 'tcp',
+            'dst-port': '10006',
+            'src-address': clientIp,
+            comment: `HA Shield [${clientIp}]: Block Free Fire TCP 10006`,
+          });
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            protocol: 'udp',
+            'dst-port': '7006',
+            'src-address': clientIp,
+            comment: `HA Shield [${clientIp}]: Block Free Fire UDP 7006`,
+          });
+        } else if (gId === 'pubg_mobile') {
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            protocol: 'udp',
+            'dst-port': '10000-20000',
+            'src-address': clientIp,
+            comment: `HA Shield [${clientIp}]: Block PUBG Game Traffic`,
+          });
+        } else if (gId === 'valorant_riot') {
+          await this.addFilterRuleAtTop({
+            chain: 'forward',
+            action: 'drop',
+            protocol: 'tcp',
+            'dst-port': '2099,5223,8393',
+            'src-address': clientIp,
+            comment: `HA Shield [${clientIp}]: Block Riot Valorant Ports`,
+          });
+        }
+      }
+
+      // LAYER 4: TLS Host rules for primary domains
+      const topDomains = uniqueDomains.slice(0, 8);
+      for (const domain of topDomains) {
+        await this.addFilterRuleAtTop({
+          chain: 'forward',
+          action: 'drop',
+          protocol: 'tcp',
+          'dst-port': '443',
+          'src-address': clientIp,
+          'tls-host': `*${domain}*`,
+          comment: `HA Shield [${clientIp}]: TLS Host ${domain}`,
+        });
+      }
+
+      // LAYER 5: RouterOS DNS Static sinkhole
+      for (const domain of uniqueDomains.slice(0, 10)) {
+        await this.makeRouterOsRequest('/ip/dns/static', {
+          method: 'PUT',
+          body: {
+            name: domain,
+            address: '0.0.0.0',
+            comment: `HA Shield [${clientIp}]: ${domain}`,
+          },
+        }).catch(() => null);
+      }
+
+      // LAYER 6: Flush active connections for this client so ongoing streams terminate immediately!
+      await this.flushClientConnections(clientIp);
+
+    } catch (err: any) {
+      console.error(`[MikroTik RouterOS] Error syncing rules for ${clientIp}:`, err.message);
+    }
+  }
+
   // --- Popular Games Blocking ---
   public async setClientBlockedGames(ipOrMac: string, gameIds: string[]) {
     let client = this.clients.find(
@@ -1940,7 +2353,7 @@ class MikroTikService {
 
     // 2. Synchronize in-memory firewall rules
     this.firewallRules = this.firewallRules.filter(
-      (r) => !r.comment?.includes(`Game Shield [${client!.ip_address}]`)
+      (r) => !r.comment?.includes(`[${client!.ip_address}]`) || !r.comment?.includes('Game')
     );
 
     for (const gId of gameIds) {
@@ -1952,102 +2365,20 @@ class MikroTikService {
           chain: 'forward',
           action: 'drop',
           src_address: client.ip_address,
-          tls_host: `*${game.domains[0]}*`,
+          tls_host: game.domains ? `*${game.domains[0]}*` : undefined,
           packets: 0,
           bytes: 0,
           disabled: false,
-          comment: `Game Shield [${client.ip_address}]: Block ${game.name}`,
+          comment: `HA Shield [${client.ip_address}]: Block ${game.name}`,
         });
       }
     }
 
-    // 3. Send real drop rules to MikroTik RouterOS firewall
-    if (this.config.connected && client.ip_address) {
-      try {
-        console.log(`[MikroTik RouterOS] Syncing game block rules for ${client.ip_address}:`, gameIds);
-        // Query active firewall filter rules from RouterOS
-        const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
-        if (Array.isArray(existingRules)) {
-          const toDelete = existingRules.filter((r: any) => {
-            const c = r.comment || '';
-            return c.includes(`Game Shield [${client!.ip_address}]`) || c.includes(`HA Game [${client!.ip_address}]`);
-          });
-
-          for (const oldRule of toDelete) {
-            const ruleId = oldRule['.id'] || oldRule.id;
-            if (ruleId) {
-              console.log(`[MikroTik RouterOS] Removing old game rule ${ruleId} (${oldRule.comment})`);
-              await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => {});
-            }
-          }
-        }
-
-        // Add rules for each game
-        for (const gId of gameIds) {
-          const game = POPULAR_GAMES.find((g) => g.id === gId);
-          if (!game) continue;
-
-          // For primary domains (up to 3)
-          const targetDomains = (game.domains || []).slice(0, 3);
-          for (const domain of targetDomains) {
-            console.log(`[MikroTik RouterOS] Adding TLS host rule for ${game.name} (${domain}) on ${client.ip_address}`);
-            await this.makeRouterOsRequest('/ip/firewall/filter', {
-              method: 'PUT',
-              body: {
-                chain: 'forward',
-                action: 'drop',
-                protocol: 'tcp',
-                'dst-port': '443',
-                'src-address': client.ip_address,
-                'tls-host': `*${domain}*`,
-                comment: `Game Shield [${client.ip_address}]: Block ${game.name} (${domain})`,
-              },
-            }).catch((err) => {
-              console.error(`[MikroTik RouterOS] Error creating TLS rule for ${domain}:`, err.message);
-            });
-          }
-
-          // If game has port definitions
-          if (game.id === 'roblox') {
-            await this.makeRouterOsRequest('/ip/firewall/filter', {
-              method: 'PUT',
-              body: {
-                chain: 'forward',
-                action: 'drop',
-                protocol: 'udp',
-                'dst-port': '49152-65535',
-                'src-address': client.ip_address,
-                comment: `Game Shield [${client.ip_address}]: Block Roblox UDP Ports`,
-              },
-            }).catch(() => {});
-          } else if (game.id === 'minecraft') {
-            await this.makeRouterOsRequest('/ip/firewall/filter', {
-              method: 'PUT',
-              body: {
-                chain: 'forward',
-                action: 'drop',
-                protocol: 'tcp',
-                'dst-port': '25565',
-                'src-address': client.ip_address,
-                comment: `Game Shield [${client.ip_address}]: Block Minecraft Java 25565`,
-              },
-            }).catch(() => {});
-            await this.makeRouterOsRequest('/ip/firewall/filter', {
-              method: 'PUT',
-              body: {
-                chain: 'forward',
-                action: 'drop',
-                protocol: 'udp',
-                'dst-port': '19132',
-                'src-address': client.ip_address,
-                comment: `Game Shield [${client.ip_address}]: Block Minecraft Bedrock 19132`,
-              },
-            }).catch(() => {});
-          }
-        }
-      } catch (err: any) {
-        console.error(`[MikroTik RouterOS] Error applying game filters for ${client.ip_address}:`, err.message);
-      }
+    // 3. Synchronize to router hardware
+    if (this.config.host && client.ip_address) {
+      await this.syncClientFirewallRules(client).catch((err) => {
+        console.error(`[MikroTik RouterOS] Error syncing game filters for ${client.ip_address}:`, err.message);
+      });
     }
 
     return client;
@@ -2075,7 +2406,7 @@ class MikroTikService {
 
     // 2. Synchronize in-memory rules
     this.firewallRules = this.firewallRules.filter(
-      (r) => !r.comment?.includes(`Web Shield [${client!.ip_address}]`)
+      (r) => !r.comment?.includes(`[${client!.ip_address}]`) || (!r.comment?.includes('Web') && !r.comment?.includes('Custom'))
     );
 
     for (const wId of websiteIds) {
@@ -2087,111 +2418,37 @@ class MikroTikService {
           chain: 'forward',
           action: 'drop',
           src_address: client.ip_address,
-          tls_host: `*${site.domains[0]}*`,
+          tls_host: site.domains ? `*${site.domains[0]}*` : undefined,
           packets: 0,
           bytes: 0,
           disabled: false,
-          comment: `Web Shield [${client.ip_address}]: Block ${site.name}`,
+          comment: `HA Shield [${client.ip_address}]: Block ${site.name}`,
         });
       }
     }
 
     for (const domain of customDomains) {
-      if (!domain.trim()) continue;
+      const clean = domain.trim();
+      if (!clean) continue;
       this.firewallRules.unshift({
         id: `fw-custom-${client.id}-${Date.now()}`,
         order: 2,
         chain: 'forward',
         action: 'drop',
         src_address: client.ip_address,
-        tls_host: `*${domain.trim()}*`,
+        tls_host: `*${clean}*`,
         packets: 0,
         bytes: 0,
         disabled: false,
-        comment: `Web Shield [${client.ip_address}]: Custom ${domain.trim()}`,
+        comment: `HA Shield [${client.ip_address}]: Custom ${clean}`,
       });
     }
 
-    // 3. Send real commands to RouterOS REST API
-    if (this.config.connected && client.ip_address) {
-      try {
-        console.log(`[MikroTik RouterOS] Syncing website filters for ${client.ip_address}:`, websiteIds, customDomains);
-        const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
-        if (Array.isArray(existingRules)) {
-          const toDelete = existingRules.filter((r: any) => {
-            const c = r.comment || '';
-            return c.includes(`Web Shield [${client!.ip_address}]`) || c.includes(`HA Web [${client!.ip_address}]`);
-          });
-
-          for (const oldRule of toDelete) {
-            const ruleId = oldRule['.id'] || oldRule.id;
-            if (ruleId) {
-              console.log(`[MikroTik RouterOS] Removing old web rule ${ruleId} (${oldRule.comment})`);
-              await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => {});
-            }
-          }
-        }
-
-        // If any site or custom domain is blocked, block UDP 443 (QUIC) so browser cannot bypass TLS inspection
-        if (websiteIds.length > 0 || customDomains.length > 0) {
-          await this.makeRouterOsRequest('/ip/firewall/filter', {
-            method: 'PUT',
-            body: {
-              chain: 'forward',
-              action: 'drop',
-              protocol: 'udp',
-              'dst-port': '443',
-              'src-address': client.ip_address,
-              comment: `Web Shield [${client.ip_address}]: Block QUIC Bypass`,
-            },
-          }).catch(() => {});
-        }
-
-        for (const wId of websiteIds) {
-          const site = POPULAR_WEBSITES.find((s) => s.id === wId);
-          if (!site) continue;
-
-          const targetDomains = (site.domains || []).slice(0, 3);
-          for (const domain of targetDomains) {
-            console.log(`[MikroTik RouterOS] Adding TLS host rule for ${site.name} (${domain}) on ${client.ip_address}`);
-            await this.makeRouterOsRequest('/ip/firewall/filter', {
-              method: 'PUT',
-              body: {
-                chain: 'forward',
-                action: 'drop',
-                protocol: 'tcp',
-                'dst-port': '443',
-                'src-address': client.ip_address,
-                'tls-host': `*${domain}*`,
-                comment: `Web Shield [${client.ip_address}]: Block ${site.name} (${domain})`,
-              },
-            }).catch((err) => {
-              console.error(`[MikroTik RouterOS] Error creating TLS rule for ${domain}:`, err.message);
-            });
-          }
-        }
-
-        for (const domain of customDomains) {
-          const clean = domain.trim();
-          if (!clean) continue;
-          await this.makeRouterOsRequest('/ip/firewall/filter', {
-            method: 'PUT',
-            body: {
-              chain: 'forward',
-              action: 'drop',
-              protocol: 'tcp',
-              'dst-port': '443',
-              'src-address': client.ip_address,
-              'tls-host': `*${clean}*`,
-              comment: `Web Shield [${client.ip_address}]: Custom ${clean}`,
-            },
-          }).catch((err) => {
-            console.error(`[MikroTik RouterOS] Error creating rule for ${clean}:`, err.message);
-          });
-        }
-      } catch (err: any) {
-        console.error(`[MikroTik RouterOS] Error applying website filters for ${client.ip_address}:`, err.message);
-      }
+    // 3. Synchronize to router hardware
+    if (this.config.host && client.ip_address) {
+      await this.syncClientFirewallRules(client).catch((err) => {
+        console.error(`[MikroTik RouterOS] Error syncing website filters for ${client.ip_address}:`, err.message);
+      });
     }
 
     return client;
@@ -2521,14 +2778,12 @@ class MikroTikService {
               method: 'PATCH',
               body: { disabled: 'no' },
             });
+            await this.moveFilterRuleToTop(ruleId);
           } else {
-            await this.makeRouterOsRequest('/ip/firewall/filter', {
-              method: 'PUT',
-              body: {
-                chain: 'forward',
-                action: 'drop',
-                comment: 'HA Panic Emergency Killswitch: Block all forwarding Internet traffic',
-              },
+            await this.addFilterRuleAtTop({
+              chain: 'forward',
+              action: 'drop',
+              comment: 'HA Panic Emergency Killswitch: Block all forwarding Internet traffic',
             });
           }
         } else {
