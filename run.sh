@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -e
 
-echo "[MikroTik Manager] Starting MikroTik Gateway Manager v1.3.5 (Home Assistant & CasaOS)..."
+echo "[MikroTik Manager] Starting MikroTik Gateway Manager v1.4.1 (Home Assistant & CasaOS)..."
 
 CONFIG_PATH=/data/options.json
 

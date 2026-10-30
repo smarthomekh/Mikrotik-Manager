@@ -193,7 +193,7 @@ x-casaos:
                 Self-Host & Deployment Hub
               </h3>
               <span className="px-2 py-0.5 text-[11px] font-mono font-semibold rounded bg-sky-500/15 text-sky-400 border border-sky-500/30">
-                v1.3.5
+                v1.4.1
               </span>
             </div>
             <p className="text-xs text-slate-400 leading-relaxed max-w-2xl">
@@ -535,7 +535,7 @@ x-casaos:
               <div className="p-4 rounded-lg bg-emerald-950/40 border border-emerald-500/30 space-y-2.5">
                 <div className="font-semibold text-emerald-300 flex items-center gap-1.5">
                   <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                  Permanent Fix in v1.3.5:
+                  Permanent Fix &amp; Updates in v1.4.1:
                 </div>
                 <ul className="list-disc list-inside space-y-1.5 text-slate-300 text-[11px]">
                   <li>
@@ -548,7 +548,7 @@ x-casaos:
                     <strong>Pre-Built Runtime:</strong> Production bundle <code className="text-sky-300 font-mono">dist/</code> included. Dockerfile installs only runtime packages in 2s with zero compiler memory crashes.
                   </li>
                   <li>
-                    <strong>Version Bumped to v1.3.5:</strong> Forces Supervisor to clear its previous failed image cache.
+                    <strong>Version Bumped to v1.4.1:</strong> Forces Supervisor to clear its previous failed image cache and deploys persistent game &amp; domain filtering on MikroTik.
                   </li>
                 </ul>
               </div>
@@ -644,7 +644,7 @@ x-casaos:
               </div>
               <h4 className="text-sm font-semibold text-white">Install &amp; Start</h4>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Select <strong className="text-slate-200">MikroTik Manager (1.3.5)</strong>, click <strong className="text-slate-200">Install</strong>. It will pull node:20-alpine without errors and run on port 3000 with native Ingress!
+                Select <strong className="text-slate-200">MikroTik Manager (1.4.1)</strong>, click <strong className="text-slate-200">Install</strong>. It will pull node:20-alpine without errors and run on port 3000 with native Ingress!
               </p>
             </div>
           </div>

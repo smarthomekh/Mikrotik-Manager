@@ -1,6 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import fs from 'node:fs';
+import path from 'node:path';
 import { POPULAR_GAMES, POPULAR_WEBSITES } from '../src/data/blocklist-catalog.ts';
 import type {
   AddressListEntry,
@@ -834,7 +836,102 @@ class MikroTikService {
 
   private throughputHistory: ThroughputHistoryPoint[] = [];
 
+  private persistedClientsState: Record<
+    string,
+    {
+      alias?: string;
+      is_blocked?: boolean;
+      blocked_games?: string[];
+      blocked_websites?: string[];
+      custom_blocked_domains?: string[];
+      schedules?: RestrictionTimeSlot[];
+      max_download_limit?: string;
+      max_upload_limit?: string;
+    }
+  > = {};
+
+  private getPersistedFilePath(): string {
+    if (fs.existsSync('/data')) {
+      return '/data/clients_state.json';
+    }
+    const localDir = path.resolve(process.cwd(), 'data');
+    if (!fs.existsSync(localDir)) {
+      try {
+        fs.mkdirSync(localDir, { recursive: true });
+      } catch {}
+    }
+    return path.resolve(localDir, 'clients_state.json');
+  }
+
+  private loadPersistedState() {
+    try {
+      const p = this.getPersistedFilePath();
+      if (fs.existsSync(p)) {
+        const content = fs.readFileSync(p, 'utf-8');
+        this.persistedClientsState = JSON.parse(content);
+        console.log(`[MikroTik Manager] Loaded persisted settings for ${Object.keys(this.persistedClientsState).length} client devices.`);
+        // Apply saved aliases/filters to existing initial clients
+        for (const client of this.clients) {
+          const saved = this.persistedClientsState[client.ip_address] || (client.mac_address ? this.persistedClientsState[client.mac_address] : null);
+          if (saved) {
+            if (saved.alias) client.alias = saved.alias;
+            if (saved.is_blocked !== undefined) {
+              client.is_blocked = saved.is_blocked;
+              client.status = saved.is_blocked ? 'blocked' : 'active';
+            }
+            if (saved.blocked_games) client.blocked_games = saved.blocked_games;
+            if (saved.blocked_websites) client.blocked_websites = saved.blocked_websites;
+            if (saved.custom_blocked_domains) client.custom_blocked_domains = saved.custom_blocked_domains;
+            if (saved.schedules) client.schedules = saved.schedules;
+            if (saved.max_download_limit) client.max_download_limit = saved.max_download_limit;
+            if (saved.max_upload_limit) client.max_upload_limit = saved.max_upload_limit;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[MikroTik Manager] Could not load persisted clients state:', err);
+    }
+  }
+
+  private savePersistedState() {
+    try {
+      const p = this.getPersistedFilePath();
+      fs.writeFileSync(p, JSON.stringify(this.persistedClientsState, null, 2), 'utf-8');
+    } catch (err) {
+      console.warn('[MikroTik Manager] Could not save persisted clients state:', err);
+    }
+  }
+
+  private async ensureBaseDropRule(): Promise<void> {
+    try {
+      const filters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 });
+      if (Array.isArray(filters)) {
+        const hasRule = filters.some(
+          (f: any) =>
+            f.chain === 'forward' &&
+            f.action === 'drop' &&
+            (f['src-address-list'] === 'ha_blocked_users' || f.src_address_list === 'ha_blocked_users')
+        );
+        if (!hasRule) {
+          console.log('[MikroTik RouterOS] Creating base forward drop rule for ha_blocked_users...');
+          await this.makeRouterOsRequest('/ip/firewall/filter', {
+            method: 'PUT',
+            body: {
+              chain: 'forward',
+              action: 'drop',
+              'src-address-list': 'ha_blocked_users',
+              comment: 'HA Drop Blocked Devices',
+            },
+          });
+        }
+      }
+    } catch (err: any) {
+      console.warn('[MikroTik RouterOS] Could not verify/create base drop rule for ha_blocked_users:', err.message);
+    }
+  }
+
   constructor() {
+    this.loadPersistedState();
     this.seedThroughputHistory();
     // Start continuous telemetry ticker
     setInterval(() => this.tick(), 1000);
@@ -1178,11 +1275,21 @@ class MikroTikService {
               const ip = l['active-address'] || l.address;
               const mac = l['active-mac-address'] || l['mac-address'] || '';
               const host = l['active-host-name'] || l['host-name'] || l.comment || `Client-${ip?.split('.').slice(-1)[0]}`;
-              const isBlocked = blockedIps.has(ip);
+              const isBlockedOnRouter = blockedIps.has(ip);
+
+              // Merge persisted settings
+              const saved = this.persistedClientsState[ip] || (mac ? this.persistedClientsState[mac] : null) || {};
+              const isBlocked = isBlockedOnRouter || Boolean(saved.is_blocked);
+              const blockedGames = saved.blocked_games || [];
+              const blockedWebsites = saved.blocked_websites || [];
+              const customDomains = saved.custom_blocked_domains || [];
+              const schedules = saved.schedules || [];
+              const alias = saved.alias || l.comment || host;
+
               return {
                 id: l['.id'] || `c-${idx}`,
                 hostname: host,
-                alias: l.comment || host,
+                alias,
                 ip_address: ip,
                 mac_address: mac,
                 vendor: 'Network Client',
@@ -1197,12 +1304,12 @@ class MikroTikService {
                 last_seen: 'Just now',
                 is_blocked: isBlocked,
                 block_method: 'firewall_address_list',
-                max_download_limit: isBlocked ? 'Blocked' : 'Uncapped',
-                max_upload_limit: isBlocked ? 'Blocked' : 'Uncapped',
-                schedules: [],
-                blocked_games: [],
-                blocked_websites: [],
-                custom_blocked_domains: [],
+                max_download_limit: isBlocked ? 'Blocked' : (saved.max_download_limit || 'Uncapped'),
+                max_upload_limit: isBlocked ? 'Blocked' : (saved.max_upload_limit || 'Uncapped'),
+                schedules,
+                blocked_games: blockedGames,
+                blocked_websites: blockedWebsites,
+                custom_blocked_domains: customDomains,
                 dhcp_status: l.status || 'bound',
               };
             });
@@ -1600,12 +1707,38 @@ class MikroTikService {
     return this.clients;
   }
 
-  public blockClient(ipOrMac: string, block: boolean) {
-    const client = this.clients.find(
+  public async blockClient(ipOrMac: string, block: boolean) {
+    let client = this.clients.find(
       (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
     );
     if (!client) {
-      throw new Error(`Device not found with IP or MAC: ${ipOrMac}`);
+      client = {
+        id: `c-${Date.now()}`,
+        hostname: `Client-${ipOrMac}`,
+        alias: `Client-${ipOrMac}`,
+        ip_address: ipOrMac,
+        mac_address: '',
+        vendor: 'Network Device',
+        interface: 'bridge',
+        connection_type: 'ethernet',
+        status: block ? 'blocked' : 'active',
+        rx_rate_bps: 0,
+        tx_rate_bps: 0,
+        total_download_bytes: 0,
+        total_upload_bytes: 0,
+        uptime: 'Active',
+        last_seen: 'Just now',
+        is_blocked: block,
+        block_method: 'firewall_address_list',
+        max_download_limit: block ? 'Blocked' : 'Uncapped',
+        max_upload_limit: block ? 'Blocked' : 'Uncapped',
+        schedules: [],
+        blocked_games: [],
+        blocked_websites: [],
+        custom_blocked_domains: [],
+        dhcp_status: 'bound',
+      };
+      this.clients.push(client);
     }
 
     client.is_blocked = block;
@@ -1613,10 +1746,21 @@ class MikroTikService {
     if (block) {
       client.rx_rate_bps = 0;
       client.tx_rate_bps = 0;
-      const existing = this.addressLists.find(
-        (a) => a.list === 'ha_blocked_users' && a.address === client.ip_address
-      );
-      if (!existing) {
+    }
+
+    // Persist to local state
+    if (!this.persistedClientsState[client.ip_address]) {
+      this.persistedClientsState[client.ip_address] = {};
+    }
+    this.persistedClientsState[client.ip_address].is_blocked = block;
+    this.savePersistedState();
+
+    // Update in-memory address list
+    const existingIndex = this.addressLists.findIndex(
+      (a) => a.list === 'ha_blocked_users' && a.address === client!.ip_address
+    );
+    if (block) {
+      if (existingIndex === -1) {
         this.addressLists.push({
           id: `al-${Date.now()}`,
           list: 'ha_blocked_users',
@@ -1627,40 +1771,66 @@ class MikroTikService {
           comment: `Blocked via Home Assistant: ${client.alias || client.hostname}`,
         });
       } else {
-        existing.disabled = false;
-      }
-
-      if (this.config.connected) {
-        this.makeRouterOsRequest('/ip/firewall/address-list', {
-          method: 'POST',
-          body: {
-            list: 'ha_blocked_users',
-            address: client.ip_address,
-            comment: `Blocked via Home Assistant: ${client.alias || client.hostname}`,
-          },
-        }).catch(() => {});
+        this.addressLists[existingIndex].disabled = false;
       }
     } else {
-      const index = this.addressLists.findIndex(
-        (a) => a.list === 'ha_blocked_users' && a.address === client.ip_address
-      );
-      let removedEntry: AddressListEntry | undefined;
-      if (index !== -1) {
-        removedEntry = this.addressLists.splice(index, 1)[0];
+      if (existingIndex !== -1) {
+        this.addressLists.splice(existingIndex, 1);
       }
+    }
 
-      if (this.config.connected && removedEntry?.id) {
-        this.makeRouterOsRequest(`/ip/firewall/address-list/${removedEntry.id}`, {
-          method: 'DELETE',
-        }).catch(() => {});
+    // Send real commands to RouterOS REST API
+    if (this.config.connected && client.ip_address) {
+      try {
+        if (block) {
+          // 1. Ensure forward drop rule exists in /ip/firewall/filter
+          await this.ensureBaseDropRule();
+
+          // 2. Query address lists to see if already present
+          const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 });
+          const alreadyInList = Array.isArray(addrLists) && addrLists.some(
+            (a: any) => a.list === 'ha_blocked_users' && a.address === client!.ip_address
+          );
+
+          if (!alreadyInList) {
+            console.log(`[MikroTik RouterOS] Adding ${client.ip_address} to ha_blocked_users address list...`);
+            await this.makeRouterOsRequest('/ip/firewall/address-list', {
+              method: 'PUT',
+              body: {
+                list: 'ha_blocked_users',
+                address: client.ip_address,
+                comment: `Blocked via Home Assistant: ${client.alias || client.hostname}`,
+              },
+            });
+          }
+        } else {
+          // Unblock: find entry on RouterOS and delete it
+          const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 });
+          if (Array.isArray(addrLists)) {
+            const matches = addrLists.filter(
+              (a: any) => a.list === 'ha_blocked_users' && a.address === client!.ip_address
+            );
+            for (const m of matches) {
+              const ruleId = m['.id'] || m.id;
+              if (ruleId) {
+                console.log(`[MikroTik RouterOS] Removing ${client.ip_address} (ID ${ruleId}) from ha_blocked_users...`);
+                await this.makeRouterOsRequest(`/ip/firewall/address-list/${ruleId}`, {
+                  method: 'DELETE',
+                });
+              }
+            }
+          }
+        }
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Failed to update router address list for ${client.ip_address}:`, err.message);
       }
     }
 
     return client;
   }
 
-  public setClientSpeedLimit(ipOrMac: string, maxDownload: string, maxUpload: string) {
-    const client = this.clients.find(
+  public async setClientSpeedLimit(ipOrMac: string, maxDownload: string, maxUpload: string) {
+    let client = this.clients.find(
       (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
     );
     if (!client) {
@@ -1670,74 +1840,68 @@ class MikroTikService {
     client.max_download_limit = maxDownload;
     client.max_upload_limit = maxUpload;
 
+    // Persist
+    if (!this.persistedClientsState[client.ip_address]) {
+      this.persistedClientsState[client.ip_address] = {};
+    }
+    this.persistedClientsState[client.ip_address].max_download_limit = maxDownload;
+    this.persistedClientsState[client.ip_address].max_upload_limit = maxUpload;
+    this.savePersistedState();
+
     const targetSubnet = `${client.ip_address}/32`;
     let queue = this.queues.find((q) => q.target === targetSubnet);
 
-    if (maxDownload === 'Uncapped' || maxDownload === '0') {
-      if (queue) {
-        if (this.config.connected && queue.id) {
-          this.makeRouterOsRequest(`/queue/simple/${queue.id}`, {
-            method: 'DELETE',
-          }).catch(() => {});
-        }
-        this.queues = this.queues.filter((q) => q.id !== queue!.id);
-      }
-      client.queue_id = undefined;
-    } else {
-      if (!queue) {
-        queue = {
-          id: `q-${Date.now()}`,
-          name: `Limit-${client.hostname.replace(/[^a-zA-Z0-9_-]/g, '')}`,
-          target: targetSubnet,
-          max_limit_upload: maxUpload,
-          max_limit_download: maxDownload,
-          priority: 5,
-          current_rate_upload_bps: 0,
-          current_rate_download_bps: 0,
-          total_bytes_upload: 0,
-          total_bytes_download: 0,
-          packet_drops: 0,
-          disabled: false,
-          dynamic: false,
-          comment: `Bandwidth limit set via Home Assistant for ${client.alias || client.hostname}`,
-        };
-        this.queues.push(queue);
+    // Send real commands to RouterOS REST API
+    if (this.config.connected && client.ip_address) {
+      try {
+        const routerQueues = await this.makeRouterOsRequest('/queue/simple', { timeoutMs: 3000 });
+        const existingRouterQueue = Array.isArray(routerQueues)
+          ? routerQueues.find((q: any) => q.target === targetSubnet || q.name === `Limit-${client!.ip_address.replace(/\./g, '_')}`)
+          : null;
 
-        if (this.config.connected) {
-          this.makeRouterOsRequest('/queue/simple', {
-            method: 'POST',
-            body: {
-              name: queue.name,
-              target: targetSubnet,
-              'max-limit': `${maxUpload}/${maxDownload}`,
-              comment: queue.comment,
-            },
-          }).catch(() => {});
+        if (maxDownload === 'Uncapped' || maxDownload === '0') {
+          if (existingRouterQueue) {
+            const qId = existingRouterQueue['.id'] || existingRouterQueue.id;
+            console.log(`[MikroTik RouterOS] Deleting speed limit queue ${qId} for ${client.ip_address}`);
+            await this.makeRouterOsRequest(`/queue/simple/${qId}`, { method: 'DELETE' });
+          }
+          this.queues = this.queues.filter((q) => q.target !== targetSubnet);
+          client.queue_id = undefined;
+        } else {
+          if (existingRouterQueue) {
+            const qId = existingRouterQueue['.id'] || existingRouterQueue.id;
+            console.log(`[MikroTik RouterOS] Updating speed limit queue ${qId} to ${maxUpload}/${maxDownload}`);
+            await this.makeRouterOsRequest(`/queue/simple/${qId}`, {
+              method: 'PATCH',
+              body: {
+                'max-limit': `${maxUpload}/${maxDownload}`,
+                disabled: 'false',
+              },
+            });
+          } else {
+            console.log(`[MikroTik RouterOS] Creating speed limit queue for ${client.ip_address} (${maxUpload}/${maxDownload})`);
+            await this.makeRouterOsRequest('/queue/simple', {
+              method: 'PUT',
+              body: {
+                name: `Limit-${client.ip_address.replace(/\./g, '_')}`,
+                target: targetSubnet,
+                'max-limit': `${maxUpload}/${maxDownload}`,
+                comment: `Speed limit for ${client.alias || client.hostname} via Home Assistant`,
+              },
+            });
+          }
         }
-      } else {
-        queue.max_limit_download = maxDownload;
-        queue.max_limit_upload = maxUpload;
-        queue.disabled = false;
-
-        if (this.config.connected && queue.id) {
-          this.makeRouterOsRequest(`/queue/simple/${queue.id}`, {
-            method: 'PATCH',
-            body: {
-              'max-limit': `${maxUpload}/${maxDownload}`,
-              disabled: 'false',
-            },
-          }).catch(() => {});
-        }
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Error updating queue for ${client.ip_address}:`, err.message);
       }
-      client.queue_id = queue.id;
     }
 
     return { client, queue };
   }
 
   // --- Multiple Restriction Time Slots ---
-  public setClientSchedules(ipOrMac: string, schedules: RestrictionTimeSlot[]) {
-    const client = this.clients.find(
+  public async setClientSchedules(ipOrMac: string, schedules: RestrictionTimeSlot[]) {
+    let client = this.clients.find(
       (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
     );
     if (!client) {
@@ -1745,12 +1909,20 @@ class MikroTikService {
     }
 
     client.schedules = schedules;
+
+    // Persist
+    if (!this.persistedClientsState[client.ip_address]) {
+      this.persistedClientsState[client.ip_address] = {};
+    }
+    this.persistedClientsState[client.ip_address].schedules = schedules;
+    this.savePersistedState();
+
     return client;
   }
 
   // --- Popular Games Blocking ---
-  public setClientBlockedGames(ipOrMac: string, gameIds: string[]) {
-    const client = this.clients.find(
+  public async setClientBlockedGames(ipOrMac: string, gameIds: string[]) {
+    let client = this.clients.find(
       (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
     );
     if (!client) {
@@ -1759,29 +1931,122 @@ class MikroTikService {
 
     client.blocked_games = gameIds;
 
-    // Synchronize MikroTik Firewall Filter rules for this device
-    // Remove old game rules for this device
+    // 1. Persist locally immediately so it's never lost on refresh
+    if (!this.persistedClientsState[client.ip_address]) {
+      this.persistedClientsState[client.ip_address] = {};
+    }
+    this.persistedClientsState[client.ip_address].blocked_games = gameIds;
+    this.savePersistedState();
+
+    // 2. Synchronize in-memory firewall rules
     this.firewallRules = this.firewallRules.filter(
-      (r) => !r.comment?.includes(`Game Shield [${client.ip_address}]`)
+      (r) => !r.comment?.includes(`Game Shield [${client!.ip_address}]`)
     );
 
-    // Create a drop rule for each selected game
     for (const gId of gameIds) {
       const game = POPULAR_GAMES.find((g) => g.id === gId);
       if (game) {
-        // Add drop rule for domain SNI match
-        this.firewallRules.splice(5, 0, {
+        this.firewallRules.unshift({
           id: `fw-game-${client.id}-${game.id}`,
-          order: 5,
+          order: 1,
           chain: 'forward',
           action: 'drop',
           src_address: client.ip_address,
-          tls_host: `*${game.domains[0].replace('.com', '')}*`,
-          packets: Math.floor(Math.random() * 400 + 10),
-          bytes: Math.floor(Math.random() * 60000 + 5000),
+          tls_host: `*${game.domains[0]}*`,
+          packets: 0,
+          bytes: 0,
           disabled: false,
           comment: `Game Shield [${client.ip_address}]: Block ${game.name}`,
         });
+      }
+    }
+
+    // 3. Send real drop rules to MikroTik RouterOS firewall
+    if (this.config.connected && client.ip_address) {
+      try {
+        console.log(`[MikroTik RouterOS] Syncing game block rules for ${client.ip_address}:`, gameIds);
+        // Query active firewall filter rules from RouterOS
+        const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
+        if (Array.isArray(existingRules)) {
+          const toDelete = existingRules.filter((r: any) => {
+            const c = r.comment || '';
+            return c.includes(`Game Shield [${client!.ip_address}]`) || c.includes(`HA Game [${client!.ip_address}]`);
+          });
+
+          for (const oldRule of toDelete) {
+            const ruleId = oldRule['.id'] || oldRule.id;
+            if (ruleId) {
+              console.log(`[MikroTik RouterOS] Removing old game rule ${ruleId} (${oldRule.comment})`);
+              await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => {});
+            }
+          }
+        }
+
+        // Add rules for each game
+        for (const gId of gameIds) {
+          const game = POPULAR_GAMES.find((g) => g.id === gId);
+          if (!game) continue;
+
+          // For primary domains (up to 3)
+          const targetDomains = (game.domains || []).slice(0, 3);
+          for (const domain of targetDomains) {
+            console.log(`[MikroTik RouterOS] Adding TLS host rule for ${game.name} (${domain}) on ${client.ip_address}`);
+            await this.makeRouterOsRequest('/ip/firewall/filter', {
+              method: 'PUT',
+              body: {
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'tcp',
+                'dst-port': '443',
+                'src-address': client.ip_address,
+                'tls-host': `*${domain}*`,
+                comment: `Game Shield [${client.ip_address}]: Block ${game.name} (${domain})`,
+              },
+            }).catch((err) => {
+              console.error(`[MikroTik RouterOS] Error creating TLS rule for ${domain}:`, err.message);
+            });
+          }
+
+          // If game has port definitions
+          if (game.id === 'roblox') {
+            await this.makeRouterOsRequest('/ip/firewall/filter', {
+              method: 'PUT',
+              body: {
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'udp',
+                'dst-port': '49152-65535',
+                'src-address': client.ip_address,
+                comment: `Game Shield [${client.ip_address}]: Block Roblox UDP Ports`,
+              },
+            }).catch(() => {});
+          } else if (game.id === 'minecraft') {
+            await this.makeRouterOsRequest('/ip/firewall/filter', {
+              method: 'PUT',
+              body: {
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'tcp',
+                'dst-port': '25565',
+                'src-address': client.ip_address,
+                comment: `Game Shield [${client.ip_address}]: Block Minecraft Java 25565`,
+              },
+            }).catch(() => {});
+            await this.makeRouterOsRequest('/ip/firewall/filter', {
+              method: 'PUT',
+              body: {
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'udp',
+                'dst-port': '19132',
+                'src-address': client.ip_address,
+                comment: `Game Shield [${client.ip_address}]: Block Minecraft Bedrock 19132`,
+              },
+            }).catch(() => {});
+          }
+        }
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Error applying game filters for ${client.ip_address}:`, err.message);
       }
     }
 
@@ -1789,8 +2054,8 @@ class MikroTikService {
   }
 
   // --- Popular Websites & Custom Domains Blocking ---
-  public setClientBlockedWebsites(ipOrMac: string, websiteIds: string[], customDomains: string[]) {
-    const client = this.clients.find(
+  public async setClientBlockedWebsites(ipOrMac: string, websiteIds: string[], customDomains: string[]) {
+    let client = this.clients.find(
       (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
     );
     if (!client) {
@@ -1800,23 +2065,31 @@ class MikroTikService {
     client.blocked_websites = websiteIds;
     client.custom_blocked_domains = customDomains;
 
-    // Synchronize Firewall Filter rules for this device
+    // 1. Persist locally immediately
+    if (!this.persistedClientsState[client.ip_address]) {
+      this.persistedClientsState[client.ip_address] = {};
+    }
+    this.persistedClientsState[client.ip_address].blocked_websites = websiteIds;
+    this.persistedClientsState[client.ip_address].custom_blocked_domains = customDomains;
+    this.savePersistedState();
+
+    // 2. Synchronize in-memory rules
     this.firewallRules = this.firewallRules.filter(
-      (r) => !r.comment?.includes(`Web Shield [${client.ip_address}]`)
+      (r) => !r.comment?.includes(`Web Shield [${client!.ip_address}]`)
     );
 
     for (const wId of websiteIds) {
       const site = POPULAR_WEBSITES.find((s) => s.id === wId);
       if (site) {
-        this.firewallRules.splice(6, 0, {
+        this.firewallRules.unshift({
           id: `fw-web-${client.id}-${site.id}`,
-          order: 6,
+          order: 2,
           chain: 'forward',
           action: 'drop',
           src_address: client.ip_address,
-          tls_host: `*${site.domains[0].split('.')[0]}*`,
-          packets: Math.floor(Math.random() * 800 + 50),
-          bytes: Math.floor(Math.random() * 120000 + 15000),
+          tls_host: `*${site.domains[0]}*`,
+          packets: 0,
+          bytes: 0,
           disabled: false,
           comment: `Web Shield [${client.ip_address}]: Block ${site.name}`,
         });
@@ -1825,18 +2098,100 @@ class MikroTikService {
 
     for (const domain of customDomains) {
       if (!domain.trim()) continue;
-      this.firewallRules.splice(6, 0, {
+      this.firewallRules.unshift({
         id: `fw-custom-${client.id}-${Date.now()}`,
-        order: 6,
+        order: 2,
         chain: 'forward',
         action: 'drop',
         src_address: client.ip_address,
         tls_host: `*${domain.trim()}*`,
-        packets: 12,
-        bytes: 1400,
+        packets: 0,
+        bytes: 0,
         disabled: false,
-        comment: `Web Shield [${client.ip_address}]: Custom domain ${domain.trim()}`,
+        comment: `Web Shield [${client.ip_address}]: Custom ${domain.trim()}`,
       });
+    }
+
+    // 3. Send real commands to RouterOS REST API
+    if (this.config.connected && client.ip_address) {
+      try {
+        console.log(`[MikroTik RouterOS] Syncing website filters for ${client.ip_address}:`, websiteIds, customDomains);
+        const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
+        if (Array.isArray(existingRules)) {
+          const toDelete = existingRules.filter((r: any) => {
+            const c = r.comment || '';
+            return c.includes(`Web Shield [${client!.ip_address}]`) || c.includes(`HA Web [${client!.ip_address}]`);
+          });
+
+          for (const oldRule of toDelete) {
+            const ruleId = oldRule['.id'] || oldRule.id;
+            if (ruleId) {
+              console.log(`[MikroTik RouterOS] Removing old web rule ${ruleId} (${oldRule.comment})`);
+              await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => {});
+            }
+          }
+        }
+
+        // If any site or custom domain is blocked, block UDP 443 (QUIC) so browser cannot bypass TLS inspection
+        if (websiteIds.length > 0 || customDomains.length > 0) {
+          await this.makeRouterOsRequest('/ip/firewall/filter', {
+            method: 'PUT',
+            body: {
+              chain: 'forward',
+              action: 'drop',
+              protocol: 'udp',
+              'dst-port': '443',
+              'src-address': client.ip_address,
+              comment: `Web Shield [${client.ip_address}]: Block QUIC Bypass`,
+            },
+          }).catch(() => {});
+        }
+
+        for (const wId of websiteIds) {
+          const site = POPULAR_WEBSITES.find((s) => s.id === wId);
+          if (!site) continue;
+
+          const targetDomains = (site.domains || []).slice(0, 3);
+          for (const domain of targetDomains) {
+            console.log(`[MikroTik RouterOS] Adding TLS host rule for ${site.name} (${domain}) on ${client.ip_address}`);
+            await this.makeRouterOsRequest('/ip/firewall/filter', {
+              method: 'PUT',
+              body: {
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'tcp',
+                'dst-port': '443',
+                'src-address': client.ip_address,
+                'tls-host': `*${domain}*`,
+                comment: `Web Shield [${client.ip_address}]: Block ${site.name} (${domain})`,
+              },
+            }).catch((err) => {
+              console.error(`[MikroTik RouterOS] Error creating TLS rule for ${domain}:`, err.message);
+            });
+          }
+        }
+
+        for (const domain of customDomains) {
+          const clean = domain.trim();
+          if (!clean) continue;
+          await this.makeRouterOsRequest('/ip/firewall/filter', {
+            method: 'PUT',
+            body: {
+              chain: 'forward',
+              action: 'drop',
+              protocol: 'tcp',
+              'dst-port': '443',
+              'src-address': client.ip_address,
+              'tls-host': `*${clean}*`,
+              comment: `Web Shield [${client.ip_address}]: Custom ${clean}`,
+            },
+          }).catch((err) => {
+            console.error(`[MikroTik RouterOS] Error creating rule for ${clean}:`, err.message);
+          });
+        }
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Error applying website filters for ${client.ip_address}:`, err.message);
+      }
     }
 
     return client;
@@ -1849,14 +2204,36 @@ class MikroTikService {
     };
   }
 
-  public setClientAlias(ipOrMac: string, alias: string) {
-    const client = this.clients.find(
+  public async setClientAlias(ipOrMac: string, alias: string) {
+    let client = this.clients.find(
       (c) => c.ip_address === ipOrMac || c.mac_address.toLowerCase() === ipOrMac.toLowerCase()
     );
     if (!client) {
       throw new Error(`Device not found: ${ipOrMac}`);
     }
     client.alias = alias;
+
+    if (!this.persistedClientsState[client.ip_address]) {
+      this.persistedClientsState[client.ip_address] = {};
+    }
+    this.persistedClientsState[client.ip_address].alias = alias;
+    this.savePersistedState();
+
+    if (this.config.connected && client.ip_address) {
+      try {
+        const leases = await this.makeRouterOsRequest('/ip/dhcp-server/lease', { timeoutMs: 3000 });
+        if (Array.isArray(leases)) {
+          const match = leases.find((l: any) => (l['active-address'] || l.address) === client!.ip_address);
+          if (match && (match['.id'] || match.id)) {
+            await this.makeRouterOsRequest(`/ip/dhcp-server/lease/${match['.id'] || match.id}`, {
+              method: 'PATCH',
+              body: { comment: alias },
+            }).catch(() => {});
+          }
+        }
+      } catch {}
+    }
+
     return client;
   }
 
@@ -1866,7 +2243,7 @@ class MikroTikService {
     return this.queues;
   }
 
-  public createQueue(newQueue: Partial<SimpleQueue>): SimpleQueue {
+  public async createQueue(newQueue: Partial<SimpleQueue>): Promise<SimpleQueue> {
     if (!newQueue.name || !newQueue.target) {
       throw new Error('Queue name and target IP/subnet are required');
     }
@@ -1893,19 +2270,60 @@ class MikroTikService {
       comment: newQueue.comment || 'Created from Home Assistant MikroTik Manager',
     };
 
+    if (this.config.connected) {
+      try {
+        const res = await this.makeRouterOsRequest('/queue/simple', {
+          method: 'PUT',
+          body: {
+            name: queue.name,
+            target: queue.target,
+            'max-limit': `${queue.max_limit_upload}/${queue.max_limit_download}`,
+            comment: queue.comment,
+            disabled: queue.disabled ? 'yes' : 'no',
+          },
+        });
+        if (res && (res['.id'] || res.id)) {
+          queue.id = res['.id'] || res.id;
+        }
+      } catch (err: any) {
+        console.error('[MikroTik RouterOS] Error creating queue on router:', err.message);
+      }
+    }
+
     this.queues.push(queue);
     return queue;
   }
 
-  public updateQueue(id: string, updates: Partial<SimpleQueue>): SimpleQueue {
+  public async updateQueue(id: string, updates: Partial<SimpleQueue>): Promise<SimpleQueue> {
     const q = this.queues.find((x) => x.id === id);
     if (!q) throw new Error(`Queue not found: ${id}`);
 
     Object.assign(q, updates);
+
+    if (this.config.connected) {
+      try {
+        const body: any = {};
+        if (updates.max_limit_upload && updates.max_limit_download) {
+          body['max-limit'] = `${updates.max_limit_upload}/${updates.max_limit_download}`;
+        }
+        if (updates.name) body.name = updates.name;
+        if (updates.target) body.target = updates.target;
+        if (updates.disabled !== undefined) body.disabled = updates.disabled ? 'yes' : 'no';
+        if (updates.comment) body.comment = updates.comment;
+
+        await this.makeRouterOsRequest(`/queue/simple/${id}`, {
+          method: 'PATCH',
+          body,
+        });
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Error updating queue ${id}:`, err.message);
+      }
+    }
+
     return q;
   }
 
-  public deleteQueue(id: string) {
+  public async deleteQueue(id: string) {
     const idx = this.queues.findIndex((x) => x.id === id);
     if (idx === -1) throw new Error(`Queue not found: ${id}`);
     const removed = this.queues.splice(idx, 1)[0];
@@ -1915,6 +2333,14 @@ class MikroTikService {
       cl.queue_id = undefined;
       cl.max_download_limit = 'Uncapped';
       cl.max_upload_limit = 'Uncapped';
+    }
+
+    if (this.config.connected) {
+      try {
+        await this.makeRouterOsRequest(`/queue/simple/${id}`, { method: 'DELETE' });
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Error deleting queue ${id}:`, err.message);
+      }
     }
 
     return removed;
@@ -1980,7 +2406,7 @@ class MikroTikService {
     };
   }
 
-  public createFirewallFilterRule(newRule: Partial<FirewallFilterRule>): FirewallFilterRule {
+  public async createFirewallFilterRule(newRule: Partial<FirewallFilterRule>): Promise<FirewallFilterRule> {
     if (!newRule.chain || !newRule.action) {
       throw new Error('Chain and action are required for firewall filter rule');
     }
@@ -2006,45 +2432,116 @@ class MikroTikService {
       comment: newRule.comment || 'Added via HA MikroTik Manager',
     };
 
-    this.firewallRules.splice(this.firewallRules.length - 2, 0, rule);
+    if (this.config.connected) {
+      try {
+        const body: any = {
+          chain: rule.chain,
+          action: rule.action,
+        };
+        if (rule.src_address) body['src-address'] = rule.src_address;
+        if (rule.dst_address) body['dst-address'] = rule.dst_address;
+        if (rule.src_address_list) body['src-address-list'] = rule.src_address_list;
+        if (rule.dst_address_list) body['dst-address-list'] = rule.dst_address_list;
+        if (rule.protocol) body['protocol'] = rule.protocol;
+        if (rule.dst_port) body['dst-port'] = rule.dst_port;
+        if (rule.tls_host) body['tls-host'] = rule.tls_host;
+        if (rule.comment) body['comment'] = rule.comment;
+        if (rule.disabled) body['disabled'] = 'yes';
+
+        const created = await this.makeRouterOsRequest('/ip/firewall/filter', {
+          method: 'PUT',
+          body,
+        });
+        if (created && (created['.id'] || created.id)) {
+          rule.id = created['.id'] || created.id;
+        }
+      } catch (err: any) {
+        console.error('[MikroTik RouterOS] Error creating firewall rule:', err.message);
+      }
+    }
+
+    this.firewallRules.push(rule);
     return rule;
   }
 
-  public updateFirewallFilterRule(id: string, updates: Partial<FirewallFilterRule>) {
+  public async updateFirewallFilterRule(id: string, updates: Partial<FirewallFilterRule>) {
     const r = this.firewallRules.find((x) => x.id === id);
     if (!r) throw new Error(`Rule not found: ${id}`);
     Object.assign(r, updates);
+
+    if (this.config.connected) {
+      try {
+        const body: any = {};
+        if (updates.disabled !== undefined) body.disabled = updates.disabled ? 'yes' : 'no';
+        if (updates.comment) body.comment = updates.comment;
+        if (updates.action) body.action = updates.action;
+
+        await this.makeRouterOsRequest(`/ip/firewall/filter/${id}`, {
+          method: 'PATCH',
+          body,
+        });
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Error updating firewall rule ${id}:`, err.message);
+      }
+    }
+
     return r;
   }
 
-  public deleteFirewallFilterRule(id: string) {
+  public async deleteFirewallFilterRule(id: string) {
     const idx = this.firewallRules.findIndex((x) => x.id === id);
     if (idx === -1) throw new Error(`Rule not found: ${id}`);
-    return this.firewallRules.splice(idx, 1)[0];
+    const removed = this.firewallRules.splice(idx, 1)[0];
+
+    if (this.config.connected) {
+      try {
+        await this.makeRouterOsRequest(`/ip/firewall/filter/${id}`, { method: 'DELETE' });
+      } catch (err: any) {
+        console.error(`[MikroTik RouterOS] Error deleting firewall rule ${id}:`, err.message);
+      }
+    }
+
+    return removed;
   }
 
-  public togglePanicKillswitch(active: boolean) {
+  public async togglePanicKillswitch(active: boolean) {
     this.panicKillswitchActive = active;
-    const dropRule = this.firewallRules.find((r) => r.comment?.includes('HA Panic Emergency Killswitch'));
 
-    if (active) {
-      if (!dropRule) {
-        this.firewallRules.unshift({
-          id: 'fw-panic-killswitch',
-          order: 0,
-          chain: 'forward',
-          action: 'drop',
-          packets: 1420,
-          bytes: 980_000,
-          disabled: false,
-          comment: 'HA Panic Emergency Killswitch: Block all forwarding Internet traffic',
-        });
-      } else {
-        dropRule.disabled = false;
-      }
-    } else {
-      if (dropRule) {
-        dropRule.disabled = true;
+    if (this.config.connected) {
+      try {
+        const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
+        const dropRule = Array.isArray(existingRules)
+          ? existingRules.find((r: any) => (r.comment || '').includes('HA Panic Emergency Killswitch'))
+          : null;
+
+        if (active) {
+          if (dropRule) {
+            const ruleId = dropRule['.id'] || dropRule.id;
+            await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, {
+              method: 'PATCH',
+              body: { disabled: 'no' },
+            });
+          } else {
+            await this.makeRouterOsRequest('/ip/firewall/filter', {
+              method: 'PUT',
+              body: {
+                chain: 'forward',
+                action: 'drop',
+                comment: 'HA Panic Emergency Killswitch: Block all forwarding Internet traffic',
+              },
+            });
+          }
+        } else {
+          if (dropRule) {
+            const ruleId = dropRule['.id'] || dropRule.id;
+            await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, {
+              method: 'PATCH',
+              body: { disabled: 'yes' },
+            });
+          }
+        }
+      } catch (err: any) {
+        console.error('[MikroTik RouterOS] Error syncing panic killswitch:', err.message);
       }
     }
 
@@ -2061,7 +2558,7 @@ class MikroTikService {
   public getHomeAssistantPackage() {
     const configYaml = `name: "MikroTik Manager"
 description: "Manage MikroTik RouterOS queues, multi-restriction schedules, firewall, popular games & website filtering, and live throughput in Home Assistant."
-version: "1.3.5"
+version: "1.4.1"
 slug: "mikrotik_manager"
 url: "https://github.com/smarthomekh/hasaddon"
 init: false
@@ -2241,7 +2738,7 @@ x-casaos:
     const runSh = `#!/usr/bin/env sh
 set -e
 
-echo "[MikroTik Manager] Starting MikroTik Gateway Manager v1.3.5 (Home Assistant & CasaOS)..."
+echo "[MikroTik Manager] Starting MikroTik Gateway Manager v1.4.1 (Home Assistant & CasaOS)..."
 
 CONFIG_PATH=/data/options.json
 
@@ -2278,7 +2775,7 @@ fi
     const packageJsonContent = `{
   "name": "mikrotik-manager",
   "private": true,
-  "version": "1.3.5",
+  "version": "1.4.1",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -2407,7 +2904,7 @@ Directly monitor and govern your MikroTik router inside **CasaOS** or **Home Ass
 ## 2. Installation in Home Assistant
 1. In Home Assistant, go to **Settings > Add-ons > Add-on Store**.
 2. Click three dots (top right) > **Repositories** > Add \`https://github.com/smarthomekh/hasaddon\`.
-3. Select **MikroTik Manager** (v1.3.5) and click **Install**.
+3. Select **MikroTik Manager** (v1.4.1) and click **Install**.
 4. Set your Router IP, Username, and Password in the **Configuration** tab.
 5. Click **Start** and select **Show in sidebar**!
 `;

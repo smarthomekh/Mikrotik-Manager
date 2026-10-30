@@ -142,50 +142,50 @@ async function startServer() {
     }
   });
 
-  app.post('/api/clients/:ip/block', (req, res) => {
+  app.post('/api/clients/:ip/block', async (req, res) => {
     try {
       const { block } = req.body;
-      const client = mikrotikService.blockClient(req.params.ip, Boolean(block));
+      const client = await mikrotikService.blockClient(req.params.ip, Boolean(block));
       res.json({ success: true, client });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.post('/api/clients/:ip/speed', (req, res) => {
+  app.post('/api/clients/:ip/speed', async (req, res) => {
     try {
       const { maxDownload, maxUpload } = req.body;
-      const result = mikrotikService.setClientSpeedLimit(req.params.ip, maxDownload, maxUpload);
+      const result = await mikrotikService.setClientSpeedLimit(req.params.ip, maxDownload, maxUpload);
       res.json({ success: true, ...result });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.post('/api/clients/:ip/schedules', (req, res) => {
+  app.post('/api/clients/:ip/schedules', async (req, res) => {
     try {
       const { schedules } = req.body;
-      const client = mikrotikService.setClientSchedules(req.params.ip, schedules);
+      const client = await mikrotikService.setClientSchedules(req.params.ip, schedules);
       res.json({ success: true, client });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.post('/api/clients/:ip/games', (req, res) => {
+  app.post('/api/clients/:ip/games', async (req, res) => {
     try {
       const { games } = req.body;
-      const client = mikrotikService.setClientBlockedGames(req.params.ip, games || []);
+      const client = await mikrotikService.setClientBlockedGames(req.params.ip, games || []);
       res.json({ success: true, client });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.post('/api/clients/:ip/websites', (req, res) => {
+  app.post('/api/clients/:ip/websites', async (req, res) => {
     try {
       const { websites, customDomains } = req.body;
-      const client = mikrotikService.setClientBlockedWebsites(
+      const client = await mikrotikService.setClientBlockedWebsites(
         req.params.ip,
         websites || [],
         customDomains || []
@@ -205,10 +205,10 @@ async function startServer() {
     }
   });
 
-  app.post('/api/clients/:ip/alias', (req, res) => {
+  app.post('/api/clients/:ip/alias', async (req, res) => {
     try {
       const { alias } = req.body;
-      const client = mikrotikService.setClientAlias(req.params.ip, alias);
+      const client = await mikrotikService.setClientAlias(req.params.ip, alias);
       res.json({ success: true, client });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
@@ -225,27 +225,27 @@ async function startServer() {
     }
   });
 
-  app.post('/api/queues', (req, res) => {
+  app.post('/api/queues', async (req, res) => {
     try {
-      const queue = mikrotikService.createQueue(req.body);
+      const queue = await mikrotikService.createQueue(req.body);
       res.json({ success: true, queue });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.put('/api/queues/:id', (req, res) => {
+  app.put('/api/queues/:id', async (req, res) => {
     try {
-      const queue = mikrotikService.updateQueue(req.params.id, req.body);
+      const queue = await mikrotikService.updateQueue(req.params.id, req.body);
       res.json({ success: true, queue });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.delete('/api/queues/:id', (req, res) => {
+  app.delete('/api/queues/:id', async (req, res) => {
     try {
-      const removed = mikrotikService.deleteQueue(req.params.id);
+      const removed = await mikrotikService.deleteQueue(req.params.id);
       res.json({ success: true, removed });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
@@ -308,37 +308,37 @@ async function startServer() {
     }
   });
 
-  app.post('/api/firewall/filter', (req, res) => {
+  app.post('/api/firewall/filter', async (req, res) => {
     try {
-      const rule = mikrotikService.createFirewallFilterRule(req.body);
+      const rule = await mikrotikService.createFirewallFilterRule(req.body);
       res.json({ success: true, rule });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.put('/api/firewall/filter/:id', (req, res) => {
+  app.put('/api/firewall/filter/:id', async (req, res) => {
     try {
-      const rule = mikrotikService.updateFirewallFilterRule(req.params.id, req.body);
+      const rule = await mikrotikService.updateFirewallFilterRule(req.params.id, req.body);
       res.json({ success: true, rule });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.delete('/api/firewall/filter/:id', (req, res) => {
+  app.delete('/api/firewall/filter/:id', async (req, res) => {
     try {
-      const removed = mikrotikService.deleteFirewallFilterRule(req.params.id);
+      const removed = await mikrotikService.deleteFirewallFilterRule(req.params.id);
       res.json({ success: true, removed });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  app.post('/api/firewall/killswitch', (req, res) => {
+  app.post('/api/firewall/killswitch', async (req, res) => {
     try {
       const { active } = req.body;
-      const result = mikrotikService.togglePanicKillswitch(Boolean(active));
+      const result = await mikrotikService.togglePanicKillswitch(Boolean(active));
       res.json({ success: true, ...result });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
