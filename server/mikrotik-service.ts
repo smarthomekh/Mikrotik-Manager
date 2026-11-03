@@ -1686,7 +1686,63 @@ class MikroTikService {
     return false;
   }
 
-  private async tryRouterOsCliFallback(endpoint: string, method: string, body?: any): Promise<any> {
+  private sanitizePayload(body: any): any {
+    if (!body || typeof body !== 'object') return body;
+    const cleaned: Record<string, any> = {};
+    for (const [k, v] of Object.entries(body)) {
+      if (v === undefined) continue;
+      // RouterOS v7 REST strictly requires booleans for boolean fields
+      if (k === 'disabled' || k === 'dynamic' || k === 'running' || k === 'invalid' || k === 'default') {
+        cleaned[k] = Boolean(v === true || v === 'yes' || v === 'true');
+      } else {
+        cleaned[k] = v;
+      }
+    }
+    return cleaned;
+  }
+
+  public async killClientConnections(ip: string): Promise<number> {
+    if (!this.config.host || !ip) return 0;
+    let killed = 0;
+    try {
+      // Query active connection tracking entries on RouterOS
+      const conns = await this.makeRouterOsRequest('/ip/firewall/connection', { timeoutMs: 3000 }).catch(() => null);
+      if (Array.isArray(conns)) {
+        const matching = conns.filter((c: any) => {
+          const src = String(c['src-address'] || '');
+          const dst = String(c['dst-address'] || '');
+          const replySrc = String(c['reply-src-address'] || '');
+          const replyDst = String(c['reply-dst-address'] || '');
+          return (
+            src.startsWith(`${ip}:`) ||
+            dst.startsWith(`${ip}:`) ||
+            replySrc.startsWith(`${ip}:`) ||
+            replyDst.startsWith(`${ip}:`)
+          );
+        });
+
+        for (const conn of matching.slice(0, 60)) {
+          const connId = conn['.id'] || conn.id;
+          if (connId) {
+            await this.makeRouterOsRequest(`/ip/firewall/connection/${connId}`, {
+              method: 'DELETE',
+              timeoutMs: 1500,
+            }).catch(() => {});
+            killed++;
+          }
+        }
+        if (killed > 0) {
+          console.log(`[MikroTik RouterOS] Flushed ${killed} active connection tracking entries for ${ip}`);
+        }
+      }
+    } catch (err: any) {
+      console.warn(`[MikroTik RouterOS] Could not flush connections for ${ip}:`, err.message);
+    }
+    return killed;
+  }
+
+  private async tryRouterOsCliFallback(endpoint: string, method: string, rawBody?: any): Promise<any> {
+    const body = this.sanitizePayload(rawBody);
     try {
       const clean = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
       const authConfig = {
@@ -1698,16 +1754,27 @@ class MikroTikService {
         allow_insecure_cert: this.config.allow_insecure_cert ?? true,
       };
 
-      if (method === 'PUT') {
-        const addEndpoint = `${clean}/add`;
-        const res = await doRouterRequest(authConfig, addEndpoint, {
+      if (method === 'PUT' || method === 'POST') {
+        // Strategy A: Direct POST /rest/path
+        const resA = await doRouterRequest(authConfig, clean, {
           method: 'POST',
           body,
           timeoutMs: 4000,
-        });
-        if (res.status >= 200 && res.status < 300) {
+        }).catch(() => null);
+        if (resA && resA.status >= 200 && resA.status < 300) {
+          return resA.data;
+        }
+
+        // Strategy B: CLI POST /rest/path/add
+        const addEndpoint = `${clean}/add`;
+        const resB = await doRouterRequest(authConfig, addEndpoint, {
+          method: 'POST',
+          body,
+          timeoutMs: 4000,
+        }).catch(() => null);
+        if (resB && resB.status >= 200 && resB.status < 300) {
           console.log(`[MikroTik CLI Fallback] Success on POST ${addEndpoint}`);
-          return res.data;
+          return resB.data;
         }
       }
 
@@ -1721,8 +1788,8 @@ class MikroTikService {
             method: 'POST',
             body: { '.id': itemId, numbers: itemId },
             timeoutMs: 4000,
-          });
-          if (res.status >= 200 && res.status < 300) {
+          }).catch(() => null);
+          if (res && res.status >= 200 && res.status < 300) {
             console.log(`[MikroTik CLI Fallback] Success on POST ${removeEndpoint} for ${itemId}`);
             return res.data;
           }
@@ -1734,15 +1801,27 @@ class MikroTikService {
         if (lastSlash > 0) {
           const parent = clean.substring(0, lastSlash);
           const itemId = clean.substring(lastSlash + 1);
+
+          // Strategy A: POST /rest/path with ID
+          const resA = await doRouterRequest(authConfig, clean, {
+            method: 'POST',
+            body: { '.id': itemId, ...body },
+            timeoutMs: 4000,
+          }).catch(() => null);
+          if (resA && resA.status >= 200 && resA.status < 300) {
+            return resA.data;
+          }
+
+          // Strategy B: POST /rest/parent/set
           const setEndpoint = `${parent}/set`;
-          const res = await doRouterRequest(authConfig, setEndpoint, {
+          const resB = await doRouterRequest(authConfig, setEndpoint, {
             method: 'POST',
             body: { '.id': itemId, numbers: itemId, ...(body || {}) },
             timeoutMs: 4000,
-          });
-          if (res.status >= 200 && res.status < 300) {
+          }).catch(() => null);
+          if (resB && resB.status >= 200 && resB.status < 300) {
             console.log(`[MikroTik CLI Fallback] Success on POST ${setEndpoint} for ${itemId}`);
-            return res.data;
+            return resB.data;
           }
         }
       }
@@ -1753,7 +1832,7 @@ class MikroTikService {
   }
 
   // --- Real RouterOS REST API communication (RouterOS v7) ---
-  private async makeRouterOsRequest(
+  public async makeRouterOsRequest(
     endpoint: string,
     options: { method?: string; body?: any; timeoutMs?: number } = {}
   ): Promise<any> {
@@ -1762,6 +1841,7 @@ class MikroTikService {
     }
 
     const method = (options.method || 'GET').toUpperCase();
+    const sanitizedBody = this.sanitizePayload(options.body);
 
     try {
       const res = await doRouterRequest(
@@ -1774,7 +1854,11 @@ class MikroTikService {
           allow_insecure_cert: this.config.allow_insecure_cert ?? true,
         },
         endpoint,
-        options
+        {
+          ...options,
+          method,
+          body: sanitizedBody,
+        }
       );
 
       if (res.status >= 200 && res.status < 300) {
@@ -1784,9 +1868,9 @@ class MikroTikService {
         return res.data;
       }
 
-      // If standard REST failed, attempt RouterOS CLI console fallback
+      // If standard REST returned error (400, 404, 405), invoke multi-strategy CLI fallback
       if (res.status === 404 || res.status === 405 || res.status === 400) {
-        const fallback = await this.tryRouterOsCliFallback(endpoint, method, options.body);
+        const fallback = await this.tryRouterOsCliFallback(endpoint, method, sanitizedBody);
         if (fallback !== null) {
           this.config.connected = true;
           this.config.last_error = undefined;
@@ -1798,8 +1882,8 @@ class MikroTikService {
       const errDetail = typeof res.data === 'object' ? JSON.stringify(res.data) : res.raw || res.statusText;
       throw new Error(`RouterOS HTTP ${res.status}: ${errDetail}`);
     } catch (err: any) {
-      if (method === 'PUT' || method === 'DELETE' || method === 'PATCH') {
-        const fallback = await this.tryRouterOsCliFallback(endpoint, method, options.body).catch(() => null);
+      if (method === 'PUT' || method === 'POST' || method === 'DELETE' || method === 'PATCH') {
+        const fallback = await this.tryRouterOsCliFallback(endpoint, method, sanitizedBody).catch(() => null);
         if (fallback !== null) {
           this.config.connected = true;
           this.config.last_error = undefined;
@@ -2141,11 +2225,38 @@ class MikroTikService {
     if (this.config.host && client.ip_address) {
       try {
         if (block) {
-          // 1. Ensure forward drop rule exists in /ip/firewall/filter
+          console.log(`[MikroTik RouterOS] Enforcing complete cutoff for client ${client.ip_address}...`);
+          // 1. Add direct forward drop rules at top of firewall
+          await this.addFirewallFilterRuleToRouter({
+            chain: 'forward',
+            action: 'drop',
+            'src-address': client.ip_address,
+            disabled: false,
+            comment: `HA Cutoff [${client.ip_address}]: Block Outbound Forward`,
+          }).catch((err) => console.warn('[MikroTik RouterOS] Direct outbound drop rule notice:', err.message));
+
+          await this.addFirewallFilterRuleToRouter({
+            chain: 'forward',
+            action: 'drop',
+            'dst-address': client.ip_address,
+            disabled: false,
+            comment: `HA Cutoff [${client.ip_address}]: Block Inbound Forward`,
+          }).catch((err) => console.warn('[MikroTik RouterOS] Direct inbound drop rule notice:', err.message));
+
+          // 2. Add input drop rule so client cannot query router DNS or management
+          await this.addFirewallFilterRuleToRouter({
+            chain: 'input',
+            action: 'drop',
+            'src-address': client.ip_address,
+            disabled: false,
+            comment: `HA Cutoff [${client.ip_address}]: Block Input DNS`,
+          }).catch((err) => console.warn('[MikroTik RouterOS] Input drop rule notice:', err.message));
+
+          // 3. Ensure base drop rule exists for address-list ha_blocked_users
           await this.ensureBaseDropRule();
 
-          // 2. Query address lists to see if already present
-          const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 });
+          // 4. Query address lists and add client if not present
+          const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 }).catch(() => null);
           const alreadyInList =
             Array.isArray(addrLists) &&
             addrLists.some(
@@ -2159,13 +2270,37 @@ class MikroTikService {
               body: {
                 list: 'ha_blocked_users',
                 address: client.ip_address,
+                disabled: false,
                 comment: `Blocked via Home Assistant: ${client.alias || client.hostname}`,
               },
             });
           }
+
+          // 5. Terminate all active stateful connection tracking entries immediately!
+          await this.killClientConnections(client.ip_address);
         } else {
-          // Unblock: find entry on RouterOS and delete it
-          const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 });
+          console.log(`[MikroTik RouterOS] Unblocking client ${client.ip_address}...`);
+          // 1. Remove direct cutoff filter rules
+          const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => null);
+          if (Array.isArray(existingRules)) {
+            const cutoffRules = existingRules.filter((r: any) => {
+              const c = r.comment || '';
+              return (
+                c.includes(`HA Cutoff [${client.ip_address}]`) ||
+                c.includes(`Client Cutoff [${client.ip_address}]`) ||
+                (r['src-address'] === client.ip_address && c.includes('Cutoff'))
+              );
+            });
+            for (const r of cutoffRules) {
+              const ruleId = r['.id'] || r.id;
+              if (ruleId) {
+                await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, { method: 'DELETE' }).catch(() => {});
+              }
+            }
+          }
+
+          // 2. Remove entry from ha_blocked_users address list
+          const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 }).catch(() => null);
           if (Array.isArray(addrLists)) {
             const matches = addrLists.filter(
               (a: any) => a.list === 'ha_blocked_users' && a.address === client.ip_address
@@ -2176,13 +2311,13 @@ class MikroTikService {
                 console.log(`[MikroTik RouterOS] Removing ${client.ip_address} (ID ${ruleId}) from ha_blocked_users...`);
                 await this.makeRouterOsRequest(`/ip/firewall/address-list/${ruleId}`, {
                   method: 'DELETE',
-                });
+                }).catch(() => {});
               }
             }
           }
         }
       } catch (err: any) {
-        console.error(`[MikroTik RouterOS] Failed to update router address list for ${client.ip_address}:`, err.message);
+        console.error(`[MikroTik RouterOS] Failed to update router block state for ${client.ip_address}:`, err.message);
       }
     }
 
@@ -2214,6 +2349,7 @@ class MikroTikService {
           ? routerQueues.find(
               (q: any) =>
                 q.target === targetSubnet ||
+                q.target?.startsWith(`${client.ip_address}/`) ||
                 q.name === `Limit-${client.ip_address.replace(/\./g, '_')}`
             )
           : null;
@@ -2234,9 +2370,10 @@ class MikroTikService {
               method: 'PATCH',
               body: {
                 'max-limit': `${maxUpload}/${maxDownload}`,
-                disabled: 'no',
+                disabled: false,
               },
             });
+            client.queue_id = qId;
           } else {
             console.log(`[MikroTik RouterOS] Creating speed limit queue for ${client.ip_address} (${maxUpload}/${maxDownload})`);
             const created = await this.makeRouterOsRequest('/queue/simple', {
@@ -2245,6 +2382,7 @@ class MikroTikService {
                 name: `Limit-${client.ip_address.replace(/\./g, '_')}`,
                 target: targetSubnet,
                 'max-limit': `${maxUpload}/${maxDownload}`,
+                disabled: false,
                 comment: `Speed limit for ${client.alias || client.hostname} via Home Assistant`,
               },
             });
@@ -2304,7 +2442,7 @@ class MikroTikService {
           chain: 'forward',
           action: 'drop',
           src_address: client.ip_address,
-          tls_host: `*${game.domains[0]}*`,
+          tls_host: game.domains[0],
           packets: 0,
           bytes: 0,
           disabled: false,
@@ -2335,27 +2473,63 @@ class MikroTikService {
             }
           }
 
-          // Add rules for each game placed at the very top of the forward chain
+          // If games are selected, populate FQDN address-lists and add drop rules
           for (const gId of gameIds) {
             const game = POPULAR_GAMES.find((g) => g.id === gId);
             if (!game) continue;
 
-            const targetDomains = (game.domains || []).slice(0, 3);
+            const listName = `ha_game_${game.id}`;
+
+            // Add domains to FQDN address list (RouterOS v7 auto-resolves FQDN addresses)
+            for (const domain of (game.domains || []).slice(0, 3)) {
+              await this.makeRouterOsRequest('/ip/firewall/address-list', {
+                method: 'PUT',
+                body: {
+                  list: listName,
+                  address: domain,
+                  disabled: false,
+                  comment: `Game Shield: ${game.name} (${domain})`,
+                },
+              }).catch(() => {});
+            }
+
+            // 1. Drop rule matching destination address-list
+            await this.addFirewallFilterRuleToRouter({
+              chain: 'forward',
+              action: 'drop',
+              'src-address': client.ip_address,
+              'dst-address-list': listName,
+              disabled: false,
+              comment: `Game Shield [${client.ip_address}]: Block ${game.name} IP List`,
+            }).catch((err) => console.error(`[MikroTik RouterOS] Address-list drop rule error:`, err.message));
+
+            // 2. Drop rules matching TLS host (with valid RouterOS syntax: *.domain and domain)
+            const targetDomains = (game.domains || []).slice(0, 2);
             for (const domain of targetDomains) {
-              console.log(`[MikroTik RouterOS] Adding TLS host rule for ${game.name} (${domain}) on ${client.ip_address}`);
               await this.addFirewallFilterRuleToRouter({
                 chain: 'forward',
                 action: 'drop',
                 protocol: 'tcp',
                 'dst-port': '443',
                 'src-address': client.ip_address,
-                'tls-host': `*${domain}*`,
+                'tls-host': `*.${domain}`,
+                disabled: false,
+                comment: `Game Shield [${client.ip_address}]: Block ${game.name} (*.${domain})`,
+              }).catch(() => {});
+
+              await this.addFirewallFilterRuleToRouter({
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'tcp',
+                'dst-port': '443',
+                'src-address': client.ip_address,
+                'tls-host': domain,
+                disabled: false,
                 comment: `Game Shield [${client.ip_address}]: Block ${game.name} (${domain})`,
-              }).catch((err) => {
-                console.error(`[MikroTik RouterOS] Error creating TLS rule for ${domain}:`, err.message);
-              });
+              }).catch(() => {});
             }
 
+            // 3. Game specific ports
             if (game.id === 'roblox') {
               await this.addFirewallFilterRuleToRouter({
                 chain: 'forward',
@@ -2363,6 +2537,7 @@ class MikroTikService {
                 protocol: 'udp',
                 'dst-port': '49152-65535',
                 'src-address': client.ip_address,
+                disabled: false,
                 comment: `Game Shield [${client.ip_address}]: Block Roblox UDP Ports`,
               }).catch(() => {});
             } else if (game.id === 'minecraft') {
@@ -2372,6 +2547,7 @@ class MikroTikService {
                 protocol: 'tcp',
                 'dst-port': '25565',
                 'src-address': client.ip_address,
+                disabled: false,
                 comment: `Game Shield [${client.ip_address}]: Block Minecraft Java 25565`,
               }).catch(() => {});
               await this.addFirewallFilterRuleToRouter({
@@ -2380,10 +2556,27 @@ class MikroTikService {
                 protocol: 'udp',
                 'dst-port': '19132',
                 'src-address': client.ip_address,
+                disabled: false,
                 comment: `Game Shield [${client.ip_address}]: Block Minecraft Bedrock 19132`,
               }).catch(() => {});
             }
           }
+
+          // If any game is blocked, block QUIC (UDP 443) so browsers/apps don't bypass HTTP inspection
+          if (gameIds.length > 0) {
+            await this.addFirewallFilterRuleToRouter({
+              chain: 'forward',
+              action: 'drop',
+              protocol: 'udp',
+              'dst-port': '443',
+              'src-address': client.ip_address,
+              disabled: false,
+              comment: `Game Shield [${client.ip_address}]: Block QUIC Bypass`,
+            }).catch(() => {});
+          }
+
+          // Flush connection tracking to terminate existing active gaming sessions
+          await this.killClientConnections(client.ip_address);
         } catch (err: any) {
           console.error(`[MikroTik RouterOS] Error applying game filters for ${client.ip_address}:`, err.message);
         }
@@ -2422,7 +2615,7 @@ class MikroTikService {
           chain: 'forward',
           action: 'drop',
           src_address: client.ip_address,
-          tls_host: `*${site.domains[0]}*`,
+          tls_host: site.domains[0],
           packets: 0,
           bytes: 0,
           disabled: false,
@@ -2439,7 +2632,7 @@ class MikroTikService {
         chain: 'forward',
         action: 'drop',
         src_address: client.ip_address,
-        tls_host: `*${domain.trim()}*`,
+        tls_host: domain.trim(),
         packets: 0,
         bytes: 0,
         disabled: false,
@@ -2468,7 +2661,7 @@ class MikroTikService {
             }
           }
 
-          // If any site or custom domain is blocked, block UDP 443 (QUIC) so browser cannot bypass TLS inspection
+          // If any site or custom domain is blocked, block UDP 443 (QUIC)
           if (websiteIds.length > 0 || customDomains.length > 0) {
             await this.addFirewallFilterRuleToRouter({
               chain: 'forward',
@@ -2476,46 +2669,119 @@ class MikroTikService {
               protocol: 'udp',
               'dst-port': '443',
               'src-address': client.ip_address,
+              disabled: false,
               comment: `Web Shield [${client.ip_address}]: Block QUIC Bypass`,
             }).catch(() => {});
           }
 
+          // Process popular websites
           for (const wId of websiteIds) {
             const site = POPULAR_WEBSITES.find((s) => s.id === wId);
             if (!site) continue;
 
-            const targetDomains = (site.domains || []).slice(0, 3);
+            const listName = `ha_web_${site.id}`;
+            // Add FQDN address list entries
+            for (const domain of (site.domains || []).slice(0, 3)) {
+              await this.makeRouterOsRequest('/ip/firewall/address-list', {
+                method: 'PUT',
+                body: {
+                  list: listName,
+                  address: domain,
+                  disabled: false,
+                  comment: `Web Shield: ${site.name} (${domain})`,
+                },
+              }).catch(() => {});
+            }
+
+            // Drop rule for address list
+            await this.addFirewallFilterRuleToRouter({
+              chain: 'forward',
+              action: 'drop',
+              'src-address': client.ip_address,
+              'dst-address-list': listName,
+              disabled: false,
+              comment: `Web Shield [${client.ip_address}]: Block ${site.name} IP List`,
+            }).catch(() => {});
+
+            // TLS host drop rules
+            const targetDomains = (site.domains || []).slice(0, 2);
             for (const domain of targetDomains) {
-              console.log(`[MikroTik RouterOS] Adding TLS host rule for ${site.name} (${domain}) on ${client.ip_address}`);
               await this.addFirewallFilterRuleToRouter({
                 chain: 'forward',
                 action: 'drop',
                 protocol: 'tcp',
                 'dst-port': '443',
                 'src-address': client.ip_address,
-                'tls-host': `*${domain}*`,
+                'tls-host': `*.${domain}`,
+                disabled: false,
+                comment: `Web Shield [${client.ip_address}]: Block ${site.name} (*.${domain})`,
+              }).catch(() => {});
+
+              await this.addFirewallFilterRuleToRouter({
+                chain: 'forward',
+                action: 'drop',
+                protocol: 'tcp',
+                'dst-port': '443',
+                'src-address': client.ip_address,
+                'tls-host': domain,
+                disabled: false,
                 comment: `Web Shield [${client.ip_address}]: Block ${site.name} (${domain})`,
-              }).catch((err) => {
-                console.error(`[MikroTik RouterOS] Error creating TLS rule for ${domain}:`, err.message);
-              });
+              }).catch(() => {});
             }
           }
 
+          // Process custom domains
+          const customListName = `ha_web_custom_${client.id}`;
           for (const domain of customDomains) {
             const clean = domain.trim();
             if (!clean) continue;
+
+            await this.makeRouterOsRequest('/ip/firewall/address-list', {
+              method: 'PUT',
+              body: {
+                list: customListName,
+                address: clean,
+                disabled: false,
+                comment: `Web Shield: Custom (${clean})`,
+              },
+            }).catch(() => {});
+
             await this.addFirewallFilterRuleToRouter({
               chain: 'forward',
               action: 'drop',
               protocol: 'tcp',
               'dst-port': '443',
               'src-address': client.ip_address,
-              'tls-host': `*${clean}*`,
-              comment: `Web Shield [${client.ip_address}]: Custom ${clean}`,
-            }).catch((err) => {
-              console.error(`[MikroTik RouterOS] Error creating rule for ${clean}:`, err.message);
-            });
+              'tls-host': `*.${clean}`,
+              disabled: false,
+              comment: `Web Shield [${client.ip_address}]: Custom (*.${clean})`,
+            }).catch(() => {});
+
+            await this.addFirewallFilterRuleToRouter({
+              chain: 'forward',
+              action: 'drop',
+              protocol: 'tcp',
+              'dst-port': '443',
+              'src-address': client.ip_address,
+              'tls-host': clean,
+              disabled: false,
+              comment: `Web Shield [${client.ip_address}]: Custom (${clean})`,
+            }).catch(() => {});
           }
+
+          if (customDomains.length > 0) {
+            await this.addFirewallFilterRuleToRouter({
+              chain: 'forward',
+              action: 'drop',
+              'src-address': client.ip_address,
+              'dst-address-list': customListName,
+              disabled: false,
+              comment: `Web Shield [${client.ip_address}]: Custom Domains List`,
+            }).catch(() => {});
+          }
+
+          // Flush connection tracking
+          await this.killClientConnections(client.ip_address);
         } catch (err: any) {
           console.error(`[MikroTik RouterOS] Error applying website filters for ${client.ip_address}:`, err.message);
         }
@@ -2615,7 +2881,7 @@ class MikroTikService {
             target: queue.target,
             'max-limit': `${queue.max_limit_upload}/${queue.max_limit_download}`,
             comment: queue.comment,
-            disabled: queue.disabled ? 'yes' : 'no',
+            disabled: queue.disabled,
           },
         });
         if (res && (res['.id'] || res.id)) {
@@ -2638,16 +2904,30 @@ class MikroTikService {
 
     if (this.config.host) {
       try {
+        let routerId = id;
+        // If it's a client generated ID, resolve real .id from router
+        if (id.startsWith('q-')) {
+          const routerQueues = await this.makeRouterOsRequest('/queue/simple', { timeoutMs: 3000 });
+          if (Array.isArray(routerQueues)) {
+            const found = routerQueues.find(
+              (rq: any) => rq.name === q.name || rq.target === q.target
+            );
+            if (found && (found['.id'] || found.id)) {
+              routerId = found['.id'] || found.id;
+            }
+          }
+        }
+
         const body: any = {};
         if (updates.max_limit_upload && updates.max_limit_download) {
           body['max-limit'] = `${updates.max_limit_upload}/${updates.max_limit_download}`;
         }
         if (updates.name) body.name = updates.name;
         if (updates.target) body.target = updates.target;
-        if (updates.disabled !== undefined) body.disabled = updates.disabled ? 'yes' : 'no';
+        if (updates.disabled !== undefined) body.disabled = Boolean(updates.disabled);
         if (updates.comment) body.comment = updates.comment;
 
-        await this.makeRouterOsRequest(`/queue/simple/${id}`, {
+        await this.makeRouterOsRequest(`/queue/simple/${routerId}`, {
           method: 'PATCH',
           body,
         });
@@ -2673,7 +2953,19 @@ class MikroTikService {
 
     if (this.config.host) {
       try {
-        await this.makeRouterOsRequest(`/queue/simple/${id}`, { method: 'DELETE' });
+        let routerId = id;
+        if (id.startsWith('q-')) {
+          const routerQueues = await this.makeRouterOsRequest('/queue/simple', { timeoutMs: 3000 });
+          if (Array.isArray(routerQueues)) {
+            const found = routerQueues.find(
+              (rq: any) => rq.name === removed.name || rq.target === removed.target
+            );
+            if (found && (found['.id'] || found.id)) {
+              routerId = found['.id'] || found.id;
+            }
+          }
+        }
+        await this.makeRouterOsRequest(`/queue/simple/${routerId}`, { method: 'DELETE' });
       } catch (err: any) {
         console.error(`[MikroTik RouterOS] Error deleting queue ${id}:`, err.message);
       }
@@ -2716,7 +3008,7 @@ class MikroTikService {
             interval: item.interval,
             'on-event': item.on_event,
             comment: item.comment,
-            disabled: item.disabled ? 'yes' : 'no',
+            disabled: item.disabled,
           },
         });
         if (res && (res['.id'] || res.id || res.ret)) {
@@ -2738,15 +3030,26 @@ class MikroTikService {
 
     if (this.config.host) {
       try {
+        let routerId = id;
+        if (id.startsWith('sch-')) {
+          const routerSchedules = await this.makeRouterOsRequest('/system/scheduler', { timeoutMs: 3000 });
+          if (Array.isArray(routerSchedules)) {
+            const found = routerSchedules.find((rs: any) => rs.name === sch.name);
+            if (found && (found['.id'] || found.id)) {
+              routerId = found['.id'] || found.id;
+            }
+          }
+        }
+
         const body: any = {};
         if (updates.name) body.name = updates.name;
         if (updates.start_time) body['start-time'] = updates.start_time;
         if (updates.interval) body.interval = updates.interval;
         if (updates.on_event) body['on-event'] = updates.on_event;
         if (updates.comment) body.comment = updates.comment;
-        if (updates.disabled !== undefined) body.disabled = updates.disabled ? 'yes' : 'no';
+        if (updates.disabled !== undefined) body.disabled = Boolean(updates.disabled);
 
-        await this.makeRouterOsRequest(`/system/scheduler/${id}`, {
+        await this.makeRouterOsRequest(`/system/scheduler/${routerId}`, {
           method: 'PATCH',
           body,
         });
@@ -2765,7 +3068,17 @@ class MikroTikService {
 
     if (this.config.host) {
       try {
-        await this.makeRouterOsRequest(`/system/scheduler/${id}`, { method: 'DELETE' });
+        let routerId = id;
+        if (id.startsWith('sch-')) {
+          const routerSchedules = await this.makeRouterOsRequest('/system/scheduler', { timeoutMs: 3000 });
+          if (Array.isArray(routerSchedules)) {
+            const found = routerSchedules.find((rs: any) => rs.name === removed.name);
+            if (found && (found['.id'] || found.id)) {
+              routerId = found['.id'] || found.id;
+            }
+          }
+        }
+        await this.makeRouterOsRequest(`/system/scheduler/${routerId}`, { method: 'DELETE' });
       } catch (err: any) {
         console.error(`[MikroTik RouterOS] Error deleting schedule ${id}:`, err.message);
       }
@@ -2835,6 +3148,7 @@ class MikroTikService {
         const body: any = {
           chain: rule.chain,
           action: rule.action,
+          disabled: rule.disabled,
         };
         if (rule.src_address) body['src-address'] = rule.src_address;
         if (rule.dst_address) body['dst-address'] = rule.dst_address;
@@ -2848,12 +3162,8 @@ class MikroTikService {
         if (rule.dst_port) body['dst-port'] = rule.dst_port;
         if (rule.tls_host) body['tls-host'] = rule.tls_host;
         if (rule.comment) body['comment'] = rule.comment;
-        if (rule.disabled) body['disabled'] = 'yes';
 
-        const created = await this.makeRouterOsRequest('/ip/firewall/filter', {
-          method: 'PUT',
-          body,
-        });
+        const created = await this.addFirewallFilterRuleToRouter(body);
         if (created && (created['.id'] || created.id)) {
           rule.id = created['.id'] || created.id;
         }
@@ -2873,12 +3183,23 @@ class MikroTikService {
 
     if (this.config.host) {
       try {
+        let routerId = id;
+        if (id.startsWith('fw-')) {
+          const routerRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 });
+          if (Array.isArray(routerRules)) {
+            const found = routerRules.find((rr: any) => rr.comment === r.comment);
+            if (found && (found['.id'] || found.id)) {
+              routerId = found['.id'] || found.id;
+            }
+          }
+        }
+
         const body: any = {};
-        if (updates.disabled !== undefined) body.disabled = updates.disabled ? 'yes' : 'no';
+        if (updates.disabled !== undefined) body.disabled = Boolean(updates.disabled);
         if (updates.comment) body.comment = updates.comment;
         if (updates.action) body.action = updates.action;
 
-        await this.makeRouterOsRequest(`/ip/firewall/filter/${id}`, {
+        await this.makeRouterOsRequest(`/ip/firewall/filter/${routerId}`, {
           method: 'PATCH',
           body,
         });
@@ -2897,7 +3218,17 @@ class MikroTikService {
 
     if (this.config.host) {
       try {
-        await this.makeRouterOsRequest(`/ip/firewall/filter/${id}`, { method: 'DELETE' });
+        let routerId = id;
+        if (id.startsWith('fw-')) {
+          const routerRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 });
+          if (Array.isArray(routerRules)) {
+            const found = routerRules.find((rr: any) => rr.comment === removed.comment);
+            if (found && (found['.id'] || found.id)) {
+              routerId = found['.id'] || found.id;
+            }
+          }
+        }
+        await this.makeRouterOsRequest(`/ip/firewall/filter/${routerId}`, { method: 'DELETE' });
       } catch (err: any) {
         console.error(`[MikroTik RouterOS] Error deleting firewall rule ${id}:`, err.message);
       }
@@ -2921,24 +3252,29 @@ class MikroTikService {
             const ruleId = dropRule['.id'] || dropRule.id;
             await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, {
               method: 'PATCH',
-              body: { disabled: 'no' },
+              body: { disabled: false },
             });
           } else {
-            await this.makeRouterOsRequest('/ip/firewall/filter', {
-              method: 'PUT',
-              body: {
-                chain: 'forward',
-                action: 'drop',
-                comment: 'HA Panic Emergency Killswitch: Block all forwarding Internet traffic',
-              },
+            await this.addFirewallFilterRuleToRouter({
+              chain: 'forward',
+              action: 'drop',
+              disabled: false,
+              comment: 'HA Panic Emergency Killswitch: Block all forwarding Internet traffic',
             });
+          }
+
+          // Flush active connections on all clients
+          for (const c of this.clients) {
+            if (c.ip_address) {
+              await this.killClientConnections(c.ip_address);
+            }
           }
         } else {
           if (dropRule) {
             const ruleId = dropRule['.id'] || dropRule.id;
             await this.makeRouterOsRequest(`/ip/firewall/filter/${ruleId}`, {
               method: 'PATCH',
-              body: { disabled: 'yes' },
+              body: { disabled: true },
             });
           }
         }
@@ -2960,7 +3296,7 @@ class MikroTikService {
   public getHomeAssistantPackage() {
     const configYaml = `name: "MikroTik Manager"
 description: "Manage MikroTik RouterOS queues, multi-restriction schedules, firewall, popular games & website filtering, and live throughput in Home Assistant."
-version: "1.4.1"
+version: "1.4.14"
 slug: "mikrotik_manager"
 url: "https://github.com/smarthomekh/hasaddon"
 init: false
@@ -3140,7 +3476,7 @@ x-casaos:
     const runSh = `#!/usr/bin/env sh
 set -e
 
-echo "[MikroTik Manager] Starting MikroTik Gateway Manager v1.4.1 (Home Assistant & CasaOS)..."
+echo "[MikroTik Manager] Starting MikroTik Gateway Manager v1.4.14 (Home Assistant & CasaOS)..."
 
 CONFIG_PATH=/data/options.json
 
@@ -3177,7 +3513,7 @@ fi
     const packageJsonContent = `{
   "name": "mikrotik-manager",
   "private": true,
-  "version": "1.4.1",
+  "version": "1.4.14",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
