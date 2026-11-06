@@ -13,7 +13,7 @@ services:
       - "3000:3000"
     environment:
       - PORT=3000
-      - ROUTER_HOST=192.168.99.1
+      - ROUTER_HOST=192.168.88.1
       - ROUTER_PORT=80
       - ROUTER_USER=admin
       - ROUTER_PASSWORD=
@@ -26,7 +26,7 @@ services:
       envs:
         - container: ROUTER_HOST
           description:
-            en_us: "MikroTik Router IP address (e.g. 192.168.88.1 or 192.168.99.1)"
+            en_us: "MikroTik Router IP address (e.g. 192.168.88.1)"
         - container: ROUTER_PORT
           description:
             en_us: "RouterOS REST API port (8443 for HTTPS or 8282/80 for HTTP)"

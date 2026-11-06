@@ -188,7 +188,7 @@ const isAlreadyExistsError = (e: any): boolean => /already have|already exists|a
 
 class MikroTikService {
   private config: RouterConnectionConfig = {
-    host: '192.168.99.1',
+    host: '192.168.88.1',
     port: 80,
     username: 'admin',
     password: '',
@@ -2880,6 +2880,9 @@ class MikroTikService {
           'start-time': item.start_time,
           interval: item.interval,
           'on-event': item.on_event,
+          // Keep the script's policy small: RouterOS only lets a user edit a scheduler whose
+          // policies the user also holds, so the default (all policies) breaks restricted users.
+          policy: 'read,write,policy,test',
           comment: item.comment,
           disabled: item.disabled,
         },
@@ -3144,7 +3147,7 @@ panel_title: "MikroTik"
 ingress: true
 ingress_port: 3000
 options:
-  router_host: "${this.config.host || '192.168.99.1'}"
+  router_host: "${this.config.host || '192.168.88.1'}"
   router_port: ${this.config.port || 8443}
   router_user: "${this.config.username || 'admin'}"
   router_password: ""
@@ -3239,7 +3242,7 @@ services:
       - "3000:3000"
     environment:
       - PORT=3000
-      - ROUTER_HOST=${this.config.host || '192.168.99.1'}
+      - ROUTER_HOST=${this.config.host || '192.168.88.1'}
       - ROUTER_PORT=${this.config.port || 8443}
       - ROUTER_USER=${this.config.username || 'admin'}
       - ROUTER_PASSWORD=${this.config.password || ''}
@@ -3252,7 +3255,7 @@ services:
       envs:
         - container: ROUTER_HOST
           description:
-            en_us: "MikroTik Router IP address (e.g. 192.168.88.1 or 192.168.99.1)"
+            en_us: "MikroTik Router IP address (e.g. 192.168.88.1)"
         - container: ROUTER_PORT
           description:
             en_us: "RouterOS REST API port (8443 for HTTPS or 8282/80 for HTTP)"
@@ -3441,13 +3444,13 @@ cards:
 
     const repositoryYaml = `name: "SmartHomeKH Add-ons"
 url: "https://github.com/smarthomekh/hasaddon"
-maintainer: "SmartHomeKH <tekdara168@gmail.com>"
+maintainer: "SmartHomeKH"
 `;
 
     const repositoryJson = `{
   "name": "SmartHomeKH Add-ons",
   "url": "https://github.com/smarthomekh/hasaddon",
-  "maintainer": "SmartHomeKH <tekdara168@gmail.com>"
+  "maintainer": "SmartHomeKH"
 }
 `;
 
@@ -3467,7 +3470,7 @@ Directly monitor and govern your MikroTik router inside **CasaOS** or **Home Ass
 2. Open the **App Store** and click **Custom Install** (or "+").
 3. Click the **Import** icon in the top right corner of the dialog.
 4. Paste the content of \`docker-compose.yml\` and click **Submit**.
-5. Set your Router IP (\`192.168.99.1\`), Port (\`8443\`), User, and Password.
+5. Set your Router IP (\`192.168.88.1\`), Port (\`8443\`), User, and Password.
 6. Click **Install**. You can now launch MikroTik Manager directly from your CasaOS home screen!
 
 ## 2. Installation in Home Assistant

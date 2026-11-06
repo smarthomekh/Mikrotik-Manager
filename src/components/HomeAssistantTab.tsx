@@ -44,7 +44,7 @@ export const HomeAssistantTab: React.FC<HomeAssistantTabProps> = ({
   const [isZipping, setIsZipping] = useState(false);
 
   // Dynamic CasaOS Compose Configuration State
-  const [casaHost, setCasaHost] = useState(routerConfig?.host || '192.168.99.1');
+  const [casaHost, setCasaHost] = useState(routerConfig?.host || '192.168.88.1');
   const [casaPort, setCasaPort] = useState(routerConfig?.port || 8443);
   const [casaUser, setCasaUser] = useState(routerConfig?.username || 'admin');
   const [casaPassword, setCasaPassword] = useState(routerConfig?.password || '');
@@ -87,7 +87,7 @@ services:
       envs:
         - container: ROUTER_HOST
           description:
-            en_us: "MikroTik Router IP address (e.g. 192.168.88.1 or 192.168.99.1)"
+            en_us: "MikroTik Router IP address (e.g. 192.168.88.1)"
         - container: ROUTER_PORT
           description:
             en_us: "RouterOS REST API port (8443 for HTTPS or 8282/80 for HTTP)"
@@ -322,7 +322,7 @@ x-casaos:
                   type="text"
                   value={casaHost}
                   onChange={(e) => setCasaHost(e.target.value)}
-                  placeholder="192.168.99.1"
+                  placeholder="192.168.88.1"
                   className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-white font-mono text-xs focus:outline-none focus:border-sky-500"
                 />
               </div>
