@@ -2880,6 +2880,9 @@ class MikroTikService {
           'start-time': item.start_time,
           interval: item.interval,
           'on-event': item.on_event,
+          // Keep the script's policy small: RouterOS only lets a user edit a scheduler whose
+          // policies the user also holds, so the default (all policies) breaks restricted users.
+          policy: 'read,write,policy,test',
           comment: item.comment,
           disabled: item.disabled,
         },
