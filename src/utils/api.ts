@@ -25,8 +25,40 @@ export function getApiBaseUrl(): string {
   return '';
 }
 
-export function apiFetch(endpoint: string, init?: RequestInit): Promise<Response> {
+export const API_ERROR_EVENT = 'mikrotik-api-error';
+
+function reportApiError(message: string) {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new CustomEvent(API_ERROR_EVENT, { detail: message }));
+}
+
+/**
+ * fetch() wrapper. For every write (non-GET) request it also checks the JSON body and raises a UI
+ * error event when the server reports `success: false` (e.g. RouterOS rejected the change), so a
+ * failed save is never silently swallowed. The original Response is returned untouched.
+ */
+export async function apiFetch(endpoint: string, init?: RequestInit): Promise<Response> {
   const base = getApiBaseUrl();
   const clean = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
-  return fetch(`${base}${clean}`, init);
+  const isWrite = (init?.method || 'GET').toUpperCase() !== 'GET';
+  try {
+    const res = await fetch(`${base}${clean}`, init);
+    if (isWrite) {
+      res
+        .clone()
+        .json()
+        .then((body) => {
+          if (body && body.success === false) {
+            reportApiError(body.error || body.message || `Request failed (${res.status})`);
+          }
+        })
+        .catch(() => {
+          if (!res.ok) reportApiError(`Request failed (${res.status} ${res.statusText})`);
+        });
+    }
+    return res;
+  } catch (err: any) {
+    if (isWrite) reportApiError(`Cannot reach the add-on server: ${err?.message || err}`);
+    throw err;
+  }
 }

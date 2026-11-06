@@ -4,3 +4,4 @@ dist
 .github
 npm-debug.log*
 .DS_Store
+data
