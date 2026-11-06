@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { apiFetch } from './utils/api.ts';
+import { apiFetch, API_ERROR_EVENT } from './utils/api.ts';
 import { ClientsTab } from './components/ClientsTab.tsx';
 import { ContentFilterModal } from './components/ContentFilterModal.tsx';
 import { ContentFilterTab } from './components/ContentFilterTab.tsx';
@@ -57,6 +57,22 @@ export default function App() {
   const [scheduleModalData, setScheduleModalData] = useState<RouterSchedule | null>(null);
   const [isScheduleModalOpen, setIsScheduleModalOpen] = useState(false);
   const [isFirewallModalOpen, setIsFirewallModalOpen] = useState(false);
+
+  // Surface failed writes (RouterOS rejected the change, network error, ...) instead of failing silently
+  const [actionError, setActionError] = useState<string | null>(null);
+  useEffect(() => {
+    let clearTimer: ReturnType<typeof setTimeout> | undefined;
+    const onError = (e: Event) => {
+      setActionError(String((e as CustomEvent).detail || 'Request failed'));
+      if (clearTimer) clearTimeout(clearTimer);
+      clearTimer = setTimeout(() => setActionError(null), 12000);
+    };
+    window.addEventListener(API_ERROR_EVENT, onError);
+    return () => {
+      window.removeEventListener(API_ERROR_EVENT, onError);
+      if (clearTimer) clearTimeout(clearTimer);
+    };
+  }, []);
 
   // Fetch live throughput, client devices, queues, and telemetry continuously every 1 second
   useEffect(() => {
@@ -490,7 +506,17 @@ export default function App() {
   };
 
   const handleRemoveAddressListEntry = async (id: string) => {
-    setAddressLists((prev) => prev.filter((a) => a.id !== id));
+    try {
+      const res = await apiFetch(`/api/firewall/address-list/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (data.success) {
+        setAddressLists((prev) => prev.filter((a) => a.id !== id));
+        const fwRes = await apiFetch('/api/firewall').then((r) => r.json());
+        if (fwRes?.success) setAddressLists(fwRes.address_lists || []);
+      }
+    } catch (err) {
+      console.error('Failed to remove address-list entry:', err);
+    }
   };
 
   // Actions: Router Configuration
@@ -518,6 +544,24 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+      {actionError && (
+        <div
+          role="alert"
+          className="fixed top-4 left-1/2 -translate-x-1/2 z-[100] max-w-xl w-[calc(100%-2rem)] rounded-lg border border-red-500/40 bg-red-950/90 px-4 py-3 text-sm text-red-100 shadow-xl backdrop-blur flex items-start gap-3"
+        >
+          <span className="flex-1 break-words">
+            <strong className="font-semibold">Router did not apply the change.</strong> {actionError}
+          </span>
+          <button
+            type="button"
+            onClick={() => setActionError(null)}
+            className="text-red-300 hover:text-white leading-none text-lg"
+            aria-label="Dismiss"
+          >
+            &times;
+          </button>
+        </div>
+      )}
       {/* Top Bar Navigation */}
       <Header
         activeTab={activeTab}

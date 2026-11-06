@@ -16,47 +16,61 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Auto-load Home Assistant Add-on configuration and persistent UI settings
-  const candidateConfigPaths = [
-    '/data/config.json',
-    path.resolve(process.cwd(), 'data', 'config.json'),
-  ];
+  // --- Router connection settings -------------------------------------------------------------
+  // Precedence: add-on options are the defaults; settings saved from the web UI win over them,
+  // unless the add-on options were edited in Home Assistant since the UI save (then options win).
+  const CONFIG_FILE_CANDIDATES = ['/data/config.json', path.resolve(process.cwd(), 'data', 'config.json')];
+  const isMasked = (v: any) => typeof v === 'string' && /^[\u2022*]+$/.test(v);
+
   let savedConfig: any = null;
-  for (const cp of candidateConfigPaths) {
+  for (const cp of CONFIG_FILE_CANDIDATES) {
     if (fs.existsSync(cp)) {
       try {
-        const raw = fs.readFileSync(cp, 'utf-8');
-        savedConfig = JSON.parse(raw);
+        savedConfig = JSON.parse(fs.readFileSync(cp, 'utf-8'));
         console.log(`[MikroTik Manager] Loaded saved router configuration from ${cp}`);
         break;
-      } catch (err) {}
+      } catch (err) {
+        console.warn(`[MikroTik Manager] Could not parse ${cp}:`, err);
+      }
     }
   }
+  // A password saved by older versions was the masked placeholder; it is useless, drop it.
+  if (savedConfig && isMasked(savedConfig.password)) delete savedConfig.password;
 
   const HA_OPTIONS_PATH = '/data/options.json';
   let haOptions: any = null;
   if (fs.existsSync(HA_OPTIONS_PATH)) {
     try {
-      const raw = fs.readFileSync(HA_OPTIONS_PATH, 'utf-8');
-      haOptions = JSON.parse(raw);
+      haOptions = JSON.parse(fs.readFileSync(HA_OPTIONS_PATH, 'utf-8'));
       console.log('[Home Assistant] Found options.json at /data/options.json');
     } catch (e) {
       console.warn('[Home Assistant] Failed to read /data/options.json:', e);
     }
   }
 
-  const mergedConfig: any = {};
-  if (savedConfig) {
-    Object.assign(mergedConfig, savedConfig);
-  }
+  const optionsConfig: any = {};
   if (haOptions) {
-    if (haOptions.router_host) mergedConfig.host = haOptions.router_host;
-    if (haOptions.router_port) mergedConfig.port = Number(haOptions.router_port);
-    if (haOptions.router_user) mergedConfig.username = haOptions.router_user;
-    if (haOptions.router_password) mergedConfig.password = haOptions.router_password;
-    if (haOptions.use_ssl !== undefined) mergedConfig.use_ssl = Boolean(haOptions.use_ssl);
-    if (haOptions.allow_insecure_cert !== undefined) mergedConfig.allow_insecure_cert = Boolean(haOptions.allow_insecure_cert);
+    if (haOptions.router_host) optionsConfig.host = String(haOptions.router_host);
+    if (haOptions.router_port) optionsConfig.port = Number(haOptions.router_port);
+    if (haOptions.router_user) optionsConfig.username = String(haOptions.router_user);
+    if (haOptions.router_password) optionsConfig.password = String(haOptions.router_password);
+    if (haOptions.use_ssl !== undefined) optionsConfig.use_ssl = Boolean(haOptions.use_ssl);
+    if (haOptions.allow_insecure_cert !== undefined) optionsConfig.allow_insecure_cert = Boolean(haOptions.allow_insecure_cert);
+    if (haOptions.poll_interval) optionsConfig.poll_interval_ms = Number(haOptions.poll_interval);
   }
+  const optionsSnapshot = JSON.stringify(optionsConfig);
+
+  let mergedConfig: any = {};
+  if (!savedConfig) {
+    mergedConfig = { ...optionsConfig };
+  } else if (haOptions && savedConfig.options_snapshot !== optionsSnapshot) {
+    // Add-on options changed in Home Assistant after the last UI save -> they take priority
+    mergedConfig = { ...savedConfig, ...optionsConfig };
+  } else {
+    mergedConfig = { ...optionsConfig, ...savedConfig };
+  }
+  delete mergedConfig.options_snapshot;
+
   if (process.env.ROUTER_HOST && !mergedConfig.host) {
     mergedConfig.host = process.env.ROUTER_HOST;
     if (process.env.ROUTER_PORT) mergedConfig.port = Number(process.env.ROUTER_PORT);
@@ -72,11 +86,28 @@ async function startServer() {
       user: mergedConfig.username,
       use_ssl: mergedConfig.use_ssl,
     });
-    await mikrotikService.setConfig({
-      ...mergedConfig,
-      mode: 'real',
-    });
+    await mikrotikService.setConfig({ ...mergedConfig, mode: 'real' });
   }
+
+  const saveConfigToDisk = () => {
+    const payload = JSON.stringify(
+      { ...mikrotikService.getPersistableConfig(), options_snapshot: optionsSnapshot },
+      null,
+      2
+    );
+    for (const p of CONFIG_FILE_CANDIDATES) {
+      try {
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        const tmp = `${p}.tmp`;
+        fs.writeFileSync(tmp, payload, { encoding: 'utf-8', mode: 0o600 });
+        fs.renameSync(tmp, p);
+        return p; // stop at the first writable location - one source of truth
+      } catch {
+        // try next location
+      }
+    }
+    throw new Error('Could not write config.json to /data or ./data');
+  };
 
   // Support Home Assistant Ingress headers
   app.use((req, res, next) => {
@@ -108,15 +139,9 @@ async function startServer() {
   app.post('/api/config', async (req, res) => {
     try {
       const updated = await mikrotikService.setConfig(req.body);
-      const paths = ['/data/config.json', path.resolve(process.cwd(), 'data', 'config.json')];
-      for (const p of paths) {
-        try {
-          const dir = path.dirname(p);
-          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-          fs.writeFileSync(p, JSON.stringify(updated, null, 2), 'utf-8');
-        } catch {}
-      }
-      res.json({ success: true, config: updated });
+      saveConfigToDisk();
+      await mikrotikService.refreshNow();
+      res.json({ success: true, config: mikrotikService.getConfig() || updated });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message });
     }
@@ -370,6 +395,15 @@ async function startServer() {
     }
   });
 
+  app.delete('/api/firewall/address-list/:id', async (req, res) => {
+    try {
+      const removed = await mikrotikService.deleteAddressListEntry(req.params.id);
+      res.json({ success: true, removed });
+    } catch (err: any) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
   // Home Assistant Add-on files & integration export
   app.get('/api/ha/package', (req, res) => {
     try {
@@ -392,6 +426,7 @@ async function startServer() {
           if (
             entry.name === 'node_modules' ||
             entry.name === '.git' ||
+            (dirPath === root && entry.name === 'data') ||
             entry.name.startsWith('.env') ||
             entry.name === 'coverage'
           ) {
@@ -448,7 +483,8 @@ async function startServer() {
       if (!fs.existsSync(indexPath)) {
         return res.status(404).send('Not Found');
       }
-      const ingressPath = (req.headers['x-ingress-path'] as string) || '';
+      const rawIngress = (req.headers['x-ingress-path'] as string) || '';
+      const ingressPath = /^\/[A-Za-z0-9/_.\-]*$/.test(rawIngress) ? rawIngress.replace(/\/+$/, '') : '';
       if (ingressPath) {
         let html = fs.readFileSync(indexPath, 'utf-8');
         const injection = `<script>window.__INGRESS_PATH__ = "${ingressPath}";</script><base href="${ingressPath}/">`;
