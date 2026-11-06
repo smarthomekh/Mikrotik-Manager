@@ -89,7 +89,7 @@ export const RouterConfigModal: React.FC<RouterConfigModalProps> = ({
   onTest,
 }) => {
   const [formData, setFormData] = useState<Partial<RouterConnectionConfig>>({
-    host: config.host || '192.168.99.1',
+    host: config.host || '192.168.88.1',
     port: config.port || 8443,
     username: config.username || 'admin',
     password: '',
@@ -199,7 +199,7 @@ export const RouterConfigModal: React.FC<RouterConfigModalProps> = ({
                   type="text"
                   value={formData.host || ''}
                   onChange={(e) => setFormData({ ...formData, host: e.target.value })}
-                  placeholder="e.g. 192.168.99.1 or xxxxx.sn.mynetname.net"
+                  placeholder="e.g. 192.168.88.1 or xxxxx.sn.mynetname.net"
                   required
                   className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-lg text-sm text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 font-mono tracking-tight"
                 />
