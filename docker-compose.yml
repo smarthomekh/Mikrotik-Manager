@@ -42,9 +42,6 @@ services:
         - container: ALLOW_INSECURE_CERT
           description:
             en_us: "Allow self-signed router SSL certificate (true/false)"
-        - container: DEMO_MODE
-          description:
-            en_us: "Enable demo simulation mode (false for live router)"
       ports:
         - container: "3000"
           description:

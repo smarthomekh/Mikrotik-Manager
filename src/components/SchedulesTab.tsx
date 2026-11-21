@@ -1,16 +1,5 @@
 import React from 'react';
-import {
-  Calendar,
-  CheckCircle2,
-  Clock,
-  Code,
-  Edit2,
-  Play,
-  Plus,
-  Power,
-  RefreshCw,
-  Trash2,
-} from 'lucide-react';
+import { Calendar, Edit2, Play, Plus, Power, Trash2 } from 'lucide-react';
 import type { RouterSchedule } from '../types/mikrotik.ts';
 
 interface SchedulesTabProps {

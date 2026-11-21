@@ -1,15 +1,5 @@
 import React from 'react';
-import {
-  Activity,
-  ArrowDown,
-  ArrowUp,
-  CheckCircle2,
-  Edit2,
-  Layers,
-  Plus,
-  Power,
-  Trash2,
-} from 'lucide-react';
+import { ArrowDown, ArrowUp, Edit2, Layers, Plus, Power, Trash2 } from 'lucide-react';
 import type { SimpleQueue } from '../types/mikrotik.ts';
 import { formatBps, formatBytes } from '../utils/formatters.ts';
 
