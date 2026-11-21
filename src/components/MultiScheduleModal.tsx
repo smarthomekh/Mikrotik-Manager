@@ -23,6 +23,14 @@ interface MultiScheduleModalProps {
 
 const ALL_DAYS: DayOfWeek[] = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
+
+// Extra QoS presets shown after the default "Throttle Speed" card. Format is RouterOS max-limit: upload/download.
+const THROTTLE_PRESETS = [
+  { speed: '30k/30k', title: 'Throttle 30k', description: 'Upload 30k · Download 30k' },
+  { speed: '100k/100k', title: 'Throttle 100k', description: 'Upload 100k · Download 100k' },
+] as const;
+const isPresetSpeed = (speed?: string) => THROTTLE_PRESETS.some((p) => p.speed === speed);
+
 export const MultiScheduleModal: React.FC<MultiScheduleModalProps> = ({
   device,
   isOpen,
@@ -113,7 +121,7 @@ export const MultiScheduleModal: React.FC<MultiScheduleModalProps> = ({
     }
   };
 
-  const getActionBadge = (action: RestrictionTimeSlot['action']) => {
+  const getActionBadge = (action: RestrictionTimeSlot['action'], speed?: string) => {
     switch (action) {
       case 'block_all':
         return <span className="text-[10px] font-semibold text-rose-400 bg-rose-500/10 px-1.5 py-0.5 rounded border border-rose-500/20">Block All Internet</span>;
@@ -122,7 +130,7 @@ export const MultiScheduleModal: React.FC<MultiScheduleModalProps> = ({
       case 'block_websites':
         return <span className="text-[10px] font-semibold text-violet-400 bg-violet-500/10 px-1.5 py-0.5 rounded border border-violet-500/20">Block Websites</span>;
       case 'throttle':
-        return <span className="text-[10px] font-semibold text-sky-400 bg-sky-500/10 px-1.5 py-0.5 rounded border border-sky-500/20">Speed Throttle</span>;
+        return <span className="text-[10px] font-semibold text-sky-400 bg-sky-500/10 px-1.5 py-0.5 rounded border border-sky-500/20">{isPresetSpeed(speed) ? `Throttle ${speed!.split('/')[0]}` : 'Speed Throttle'}</span>;
     }
   };
 
@@ -201,7 +209,7 @@ export const MultiScheduleModal: React.FC<MultiScheduleModalProps> = ({
                           {slot.start_time} - {slot.end_time}
                         </div>
                         <div className="mt-1 flex items-center gap-1.5 flex-wrap">
-                          {getActionBadge(slot.action)}
+                          {getActionBadge(slot.action, slot.throttle_speed)}
                           <span className="text-[10px] text-slate-500">
                             {slot.days.length === 7 ? 'All days' : slot.days.join(', ')}
                           </span>
@@ -394,9 +402,9 @@ export const MultiScheduleModal: React.FC<MultiScheduleModalProps> = ({
 
                   <button
                     type="button"
-                    onClick={() => handleUpdateActiveSlot({ action: 'throttle' })}
+                    onClick={() => handleUpdateActiveSlot({ action: 'throttle', throttle_speed: undefined })}
                     className={`p-2.5 rounded-lg border text-left transition-all ${
-                      activeSlot.action === 'throttle'
+                      activeSlot.action === 'throttle' && !isPresetSpeed(activeSlot.throttle_speed)
                         ? 'border-sky-500/60 bg-sky-500/10 text-white'
                         : 'border-slate-800 bg-slate-900 text-slate-400 hover:border-slate-700'
                     }`}
@@ -407,6 +415,28 @@ export const MultiScheduleModal: React.FC<MultiScheduleModalProps> = ({
                     </div>
                     <div className="text-[10px] text-slate-400">Clamp to 512k or 1M</div>
                   </button>
+
+                  {THROTTLE_PRESETS.map((preset) => {
+                    const selected = activeSlot.action === 'throttle' && activeSlot.throttle_speed === preset.speed;
+                    return (
+                      <button
+                        key={preset.speed}
+                        type="button"
+                        onClick={() => handleUpdateActiveSlot({ action: 'throttle', throttle_speed: preset.speed })}
+                        className={`p-2.5 rounded-lg border text-left transition-all ${
+                          selected
+                            ? 'border-sky-500/60 bg-sky-500/10 text-white'
+                            : 'border-slate-800 bg-slate-900 text-slate-400 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 text-xs font-semibold text-sky-300 mb-0.5">
+                          <Zap className="w-3.5 h-3.5" />
+                          <span>{preset.title}</span>
+                        </div>
+                        <div className="text-[10px] text-slate-400">{preset.description}</div>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 

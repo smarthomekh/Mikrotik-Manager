@@ -50,7 +50,7 @@ export interface RestrictionTimeSlot {
   start_time: string; // e.g. "16:00"
   end_time: string;   // e.g. "18:30"
   action: 'block_all' | 'block_games' | 'block_websites' | 'throttle';
-  throttle_speed?: string; // e.g. "512k/512k" or "1M/1M"
+  throttle_speed?: string; // RouterOS max-limit "upload/download", e.g. "30k/30k", "100k/100k"
   comment?: string;
 }
 
