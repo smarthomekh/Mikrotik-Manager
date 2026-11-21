@@ -1,17 +1,5 @@
 import React, { useState } from 'react';
-import {
-  AlertOctagon,
-  CheckCircle2,
-  ListFilter,
-  Lock,
-  Plus,
-  Power,
-  RefreshCw,
-  Shield,
-  ShieldAlert,
-  Trash2,
-  Zap,
-} from 'lucide-react';
+import { AlertOctagon, Plus, Power, Trash2 } from 'lucide-react';
 import type { AddressListEntry, FirewallFilterRule, NatRule } from '../types/mikrotik.ts';
 import { formatBytes, formatNumber } from '../utils/formatters.ts';
 

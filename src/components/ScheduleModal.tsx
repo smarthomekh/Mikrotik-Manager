@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Calendar, Code, X, Zap } from 'lucide-react';
+import { Calendar, X } from 'lucide-react';
 import type { RouterSchedule } from '../types/mikrotik.ts';
 
 interface ScheduleModalProps {

@@ -1,17 +1,5 @@
 import React, { useState } from 'react';
-import {
-  Calendar,
-  Clock,
-  Gamepad2,
-  Globe,
-  Moon,
-  Plus,
-  Power,
-  ShieldAlert,
-  Trash2,
-  X,
-  Zap,
-} from 'lucide-react';
+import { Clock, Gamepad2, Globe, Plus, ShieldAlert, Trash2, X, Zap } from 'lucide-react';
 import type { ClientDevice, DayOfWeek, RestrictionTimeSlot } from '../types/mikrotik.ts';
 
 interface MultiScheduleModalProps {

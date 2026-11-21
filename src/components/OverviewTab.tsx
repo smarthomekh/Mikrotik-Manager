@@ -1,20 +1,14 @@
 import React from 'react';
 import {
   Activity,
-  AlertTriangle,
   ArrowDown,
   ArrowUp,
   Cpu,
   Database,
-  Flame,
   Globe,
-  HardDrive,
   Laptop,
-  Radio,
   Server,
   Shield,
-  ShieldAlert,
-  Wifi,
   Zap,
 } from 'lucide-react';
 import type {
@@ -24,7 +18,7 @@ import type {
   SimpleQueue,
   ThroughputHistoryPoint,
 } from '../types/mikrotik.ts';
-import { formatBps, formatBytes, formatNumber } from '../utils/formatters.ts';
+import { formatBps, formatNumber } from '../utils/formatters.ts';
 
 interface OverviewTabProps {
   routerInfo: RouterInfo | null;

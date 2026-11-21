@@ -1,8 +1,6 @@
 import React, { useState } from 'react';
 import {
-  AlertCircle,
   Box,
-  Check,
   Cpu,
   Crosshair,
   Flame,
@@ -15,9 +13,7 @@ import {
   Star,
   Swords,
   Target,
-  Trash2,
   X,
-  Zap,
 } from 'lucide-react';
 import { POPULAR_GAMES, POPULAR_WEBSITES } from '../data/blocklist-catalog.ts';
 import type { ClientDevice } from '../types/mikrotik.ts';

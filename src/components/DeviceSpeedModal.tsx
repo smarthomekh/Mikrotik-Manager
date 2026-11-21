@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Gauge, Shield, X, Zap } from 'lucide-react';
+import { Gauge, X, Zap } from 'lucide-react';
 import type { ClientDevice } from '../types/mikrotik.ts';
 
 interface DeviceSpeedModalProps {

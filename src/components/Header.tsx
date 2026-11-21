@@ -1,13 +1,5 @@
 import React from 'react';
-import {
-  Activity,
-  AlertOctagon,
-  HardDrive,
-  RefreshCw,
-  Server,
-  Settings,
-  ShieldAlert,
-} from 'lucide-react';
+import { RefreshCw, Server, Settings, ShieldAlert } from 'lucide-react';
 import type { RouterConnectionConfig, RouterInfo } from '../types/mikrotik.ts';
 
 interface HeaderProps {

@@ -1,21 +1,6 @@
 import React from 'react';
-import {
-  Clock,
-  ExternalLink,
-  Flame,
-  Gamepad2,
-  Globe,
-  Plus,
-  Power,
-  RotateCcw,
-  Search,
-  Shield,
-  ShieldAlert,
-  Sparkles,
-  Zap,
-} from 'lucide-react';
-import { POPULAR_GAMES, POPULAR_WEBSITES } from '../data/blocklist-catalog.ts';
-import type { ClientDevice, RestrictionTimeSlot } from '../types/mikrotik.ts';
+import { Clock, Gamepad2, Globe, Shield, ShieldAlert } from 'lucide-react';
+import type { ClientDevice } from '../types/mikrotik.ts';
 
 interface ContentFilterTabProps {
   clients: ClientDevice[];

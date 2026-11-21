@@ -3,7 +3,6 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import JSZip from 'jszip';
 import { mikrotikService } from './server/mikrotik-service.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -77,6 +76,7 @@ async function startServer() {
     if (process.env.ROUTER_USER) mergedConfig.username = process.env.ROUTER_USER;
     if (process.env.ROUTER_PASSWORD) mergedConfig.password = process.env.ROUTER_PASSWORD;
     if (process.env.USE_SSL !== undefined) mergedConfig.use_ssl = process.env.USE_SSL === 'true' || process.env.USE_SSL === '1';
+    if (process.env.ALLOW_INSECURE_CERT !== undefined) mergedConfig.allow_insecure_cert = process.env.ALLOW_INSECURE_CERT !== 'false' && process.env.ALLOW_INSECURE_CERT !== '0';
   }
 
   if (mergedConfig.host) {
@@ -401,60 +401,6 @@ async function startServer() {
       res.json({ success: true, removed });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
-    }
-  });
-
-  // Home Assistant Add-on files & integration export
-  app.get('/api/ha/package', (req, res) => {
-    try {
-      const files = mikrotikService.getHomeAssistantPackage();
-      res.json({ success: true, files });
-    } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
-    }
-  });
-
-  // Complete self-contained add-on zip including compiled dist/ and all configs
-  app.get('/api/ha/download-zip', async (req, res) => {
-    try {
-      const zip = new JSZip();
-      const root = process.cwd();
-
-      const addDirRecursive = (dirPath: string, zipFolder: any) => {
-        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-        for (const entry of entries) {
-          if (
-            entry.name === 'node_modules' ||
-            entry.name === '.git' ||
-            (dirPath === root && entry.name === 'data') ||
-            entry.name.startsWith('.env') ||
-            entry.name === 'coverage'
-          ) {
-            continue;
-          }
-          const fullPath = path.join(dirPath, entry.name);
-          if (entry.isDirectory()) {
-            const sub = zipFolder.folder(entry.name);
-            addDirRecursive(fullPath, sub);
-          } else {
-            zipFolder.file(entry.name, fs.readFileSync(fullPath));
-          }
-        }
-      };
-
-      addDirRecursive(root, zip);
-      const zipBuffer = await zip.generateAsync({
-        type: 'nodebuffer',
-        compression: 'DEFLATE',
-        compressionOptions: { level: 6 },
-      });
-
-      res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', 'attachment; filename="mikrotik_manager_full_package.zip"');
-      res.send(zipBuffer);
-    } catch (err: any) {
-      console.error('[Home Assistant] Failed to generate zip package:', err);
-      res.status(500).json({ success: false, error: err.message });
     }
   });
 

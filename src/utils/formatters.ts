@@ -21,14 +21,3 @@ export function formatBytes(bytes: number): string {
 export function formatNumber(num: number): string {
   return new Intl.NumberFormat().format(num);
 }
-
-export function parseSpeedLimit(limitStr?: string): { down: string; up: string } {
-  if (!limitStr || limitStr === 'Uncapped' || limitStr === '0') {
-    return { down: 'Uncapped', up: 'Uncapped' };
-  }
-  const parts = limitStr.split('/');
-  if (parts.length === 2) {
-    return { up: parts[0], down: parts[1] };
-  }
-  return { down: limitStr, up: '5M' };
-}

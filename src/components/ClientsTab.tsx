@@ -1,18 +1,12 @@
 import React, { useState } from 'react';
 import {
-  Activity,
   ArrowDown,
   ArrowUp,
   Clock,
   Edit2,
   Filter,
-  Gamepad2,
   Gauge,
-  Globe,
   Laptop,
-  Moon,
-  Power,
-  RotateCcw,
   Search,
   Shield,
   ShieldAlert,
@@ -21,7 +15,7 @@ import {
   Wifi,
 } from 'lucide-react';
 import type { ClientDevice } from '../types/mikrotik.ts';
-import { formatBps, formatBytes } from '../utils/formatters.ts';
+import { formatBps } from '../utils/formatters.ts';
 
 interface ClientsTabProps {
   clients: ClientDevice[];
